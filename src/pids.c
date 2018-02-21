@@ -16,7 +16,9 @@
 #include <string.h>
 
 #include "defines.h"
+#include "input.h"
 #include "pids.h"
+#include "private.h"
 
 static char *chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ ?-*$ ";
 
@@ -452,6 +454,8 @@ void decode_sis(pids_t *st, uint8_t *bits)
             log_error("unexpected msg_id: %d", msg_id);
         }
     }
+
+    nrsc5_report_sis(st->input->radio, st);
 }
 
 void pids_frame_push(pids_t *st, uint8_t *bits)
@@ -467,9 +471,11 @@ void pids_frame_push(pids_t *st, uint8_t *bits)
         decode_sis(st, reversed);
 }
 
-void pids_init(pids_t *st)
+void pids_init(pids_t *st, input_t *input)
 {
     int i;
+
+    st->input = input;
 
     memset(st->country_code, 0, sizeof(st->country_code));
     st->fcc_facility_id = 0;

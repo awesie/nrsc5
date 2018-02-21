@@ -205,6 +205,7 @@ static void nrsc5_init(nrsc5_t *st)
 
 int nrsc5_open(nrsc5_t **result, const char *args)
 {
+    const char *driver;
     size_t chan = RX_CHAN;
     float bw, samp_rate;
     nrsc5_t *st = calloc(1, sizeof(*st));
@@ -213,14 +214,15 @@ int nrsc5_open(nrsc5_t **result, const char *args)
     if (!st->dev)
         goto error_init;
 
-    log_info("Driver: %s", SoapySDRDevice_getDriverKey(st->dev));
+    driver = SoapySDRDevice_getDriverKey(st->dev);
+    log_info("Driver: %s", driver);
     log_info("Hardware: %s", SoapySDRDevice_getHardwareKey(st->dev));
 
     st->decimation = 2;
     samp_rate = SAMPLE_RATE * st->decimation / 2;
 
-    if (find_supported_driver(SoapySDRDevice_getDriverKey(st->dev), &samp_rate, &st->decimation) != 0)
-        log_warn("Unsupported driver (%s). Please report success or failure along with a debug log.");
+    if (find_supported_driver(driver, &samp_rate, &st->decimation) != 0)
+        log_warn("Unsupported driver (%s). Please report success or failure along with a debug log.", driver);
 
     if (SoapySDRDevice_setSampleRate(st->dev, SOAPY_SDR_RX, chan, samp_rate) != 0)
         goto error;
@@ -343,6 +345,10 @@ int nrsc5_set_frequency(nrsc5_t *st, float freq)
     {
         if (SoapySDRDevice_setFrequency(st->dev, SOAPY_SDR_RX, RX_CHAN, freq + FREQ_OFFSET, NULL) != 0)
             return 1;
+        if (st->auto_gain)
+            st->gain = -1;
+        input_reset(&st->input);
+        output_reset(&st->output);
     }
 
     st->freq = freq;
@@ -572,4 +578,15 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
         service = service->next;
         free(p);
     }
+}
+
+void nrsc5_report_sis(nrsc5_t *st, pids_t *pids)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_SIS;
+    evt.sis.name = pids->short_name;
+    evt.sis.facility_id = pids->fcc_facility_id;
+
+    nrsc5_report(st, &evt);
 }

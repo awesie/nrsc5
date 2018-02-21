@@ -1,4 +1,5 @@
-add_compile_options (--std=gnu11 -O3 -Wall)
+add_compile_options (--std=gnu11 -O3 -fstack-protector -Wall)
+set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fstack-protector")
 
 add_definitions (-D_GNU_SOURCE)
 set (THREAD_LIBRARY pthread)
@@ -40,19 +41,35 @@ target_link_libraries (
     m
 )
 
-add_executable (
-    app
-    main.c
-)
-set_property (TARGET app PROPERTY OUTPUT_NAME nrsc5)
-target_link_libraries (
-    app
-    nrsc5
-    ${AO_LIBRARY}
-    ${THREAD_LIBRARY}
-)
+if (WITH_CLI_CLIENT)
+    add_executable (
+        app
+        main.c
+    )
+    set_property (TARGET app PROPERTY OUTPUT_NAME nrsc5)
+    target_link_libraries (
+        app
+        nrsc5
+        ${AO_LIBRARY}
+        ${THREAD_LIBRARY}
+    )
+    install (TARGETS app RUNTIME DESTINATION bin)
+endif()
 
-install (
-    TARGETS app
-    RUNTIME DESTINATION bin
-)
+if (WITH_WEB_SERVER)
+    add_executable (
+        server
+        server.c
+    )
+    set_property (TARGET server PROPERTY OUTPUT_NAME nrsc5-serve)
+    target_link_libraries (
+        server
+        nrsc5
+        ${CJSON_LIBRARY}
+        ${LWS_LIBRARY}
+        ${VORBIS_LIBRARY}
+        ${OGG_LIBRARY}
+        ${THREAD_LIBRARY}
+    )
+    install (TARGETS server RUNTIME DESTINATION bin)
+endif()

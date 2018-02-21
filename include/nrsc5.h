@@ -142,6 +142,10 @@ struct nrsc5_event_t
         struct {
             nrsc5_sig_service_t *services;
         } sig;
+        struct {
+            const char *name;
+            unsigned int facility_id;
+        } sis;
     };
 };
 typedef struct nrsc5_event_t nrsc5_event_t;
