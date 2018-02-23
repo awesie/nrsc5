@@ -11,12 +11,13 @@
 #include "defines.h"
 #include "firdecim_q15.h"
 #include "frame.h"
+#include "goertzel.h"
 #include "output.h"
 #include "sync.h"
 
 #define MAX_DECIM_LOG2 4
 
-typedef int (*input_snr_cb_t) (void *, float);
+typedef int (*input_snr_cb_t) (void *, float, float);
 
 typedef struct input_t
 {
@@ -29,6 +30,12 @@ typedef struct input_t
     firdecim_q15 firdecim[MAX_DECIM_LOG2];
     cint16_t *buffer;
     unsigned int avail, used, skip;
+
+    complex float fm_prev;
+    firdecim_q15 fm_firdecim;
+    goertzel_t fm_pilot, fm_not_pilot;
+    float fm_pilot_sum, fm_not_pilot_sum;
+    unsigned fm_pilot_idx, fm_not_pilot_idx;
 
     fftwf_plan snr_fft;
     float complex snr_fft_in[64];

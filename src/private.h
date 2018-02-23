@@ -28,6 +28,13 @@ struct nrsc5_t
     nrsc5_callback_t callback;
     void *callback_opaque;
 
+    int scanning;
+    const char *scan_name;
+    int scan_sync;
+
+    cint16_t *buffer;
+    unsigned int max_samples;
+    unsigned long long samples;
     pthread_t worker;
     pthread_mutex_t worker_mutex;
     pthread_cond_t worker_cond;

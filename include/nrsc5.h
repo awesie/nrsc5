@@ -170,7 +170,7 @@ int nrsc5_set_frequency(nrsc5_t *, float freq);
 void nrsc5_get_gain(nrsc5_t *, float *gain);
 int nrsc5_set_gain(nrsc5_t *, float gain);
 void nrsc5_set_auto_gain(nrsc5_t *, int enabled);
-int nrsc5_scan(nrsc5_t *, float begin, float end, float skip, float *result);
+int nrsc5_scan(nrsc5_t *, float begin, float end, float skip, float *result, const char **name);
 void nrsc5_set_callback(nrsc5_t *, nrsc5_callback_t callback, void *opaque);
 void nrsc5_set_audio_format(nrsc5_t *, unsigned int fmt);
 

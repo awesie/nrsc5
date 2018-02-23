@@ -24,6 +24,7 @@
 #include "private.h"
 
 #define INPUT_BUF_LEN (2160 * 512)
+#define FM_PILOT_LIMIT 1000.0
 
 /*
  * GNU Radio Filter Design Tool
@@ -88,6 +89,37 @@ static void measure_snr(input_t *st, cint16_t *buf, uint32_t len)
         st->snr_cnt++;
     }
 
+    for (i = 0; i < len; i += 4)
+    {
+        cint16_t x[2], y[2], z;
+        x[0] = buf[i];
+        x[1] = buf[i + 1];
+        halfband_q15_execute(st->firdecim[0], x, &y[0]);
+        x[0] = buf[i + 2];
+        x[1] = buf[i + 3];
+        halfband_q15_execute(st->firdecim[0], x, &y[1]);
+        halfband_q15_execute(st->fm_firdecim, y, &z);
+
+        float complex fz = cq15_to_cf(z);
+        float angle = cargf(fz * conjf(st->fm_prev));
+        st->fm_prev = fz;
+
+        float mag, mag2;
+        if (goertzel_execute(&st->fm_pilot, angle / M_PI, &mag))
+        {
+            mag = fminf(FM_PILOT_LIMIT, mag);
+            st->fm_pilot_sum += mag*mag;
+            st->fm_pilot_idx++;
+        }
+        if (goertzel_execute(&st->fm_not_pilot, angle / M_PI, &mag2))
+        {
+            mag2 = fminf(FM_PILOT_LIMIT, mag2);
+            mag2 *= 16;
+            st->fm_not_pilot_sum += mag2*mag2;
+            st->fm_not_pilot_idx++;
+        }
+    }
+
     if (st->snr_cnt >= SNR_FFT_COUNT)
     {
         // noise bands are the frequncies near our signal
@@ -113,12 +145,20 @@ static void measure_snr(input_t *st, cint16_t *buf, uint32_t len)
         float noise = (noise_lo + noise_hi) / 2 / st->snr_cnt;
         float snr = signal / noise;
 
-        if (st->snr_cb(st->snr_cb_arg, snr) == 0)
+        float pilot_avg = st->fm_pilot_sum / st->fm_pilot_idx;
+        float not_pilot_avg = (st->fm_not_pilot_sum / st->fm_not_pilot_idx);
+
+        if (st->snr_cb(st->snr_cb_arg, snr, 10 * log10f(pilot_avg / not_pilot_avg)) == 0)
             st->snr_cb = NULL;
 
         st->snr_cnt = 0;
         for (i = 0; i < 64; ++i)
             st->snr_power[i] = 0;
+
+        st->fm_pilot_idx = 0;
+        st->fm_pilot_sum = 0;
+        st->fm_not_pilot_idx = 0;
+        st->fm_not_pilot_sum = 0;
     }
 }
 
@@ -236,6 +276,15 @@ void input_reset(input_t *st)
     for (int i = 0; i < MAX_DECIM_LOG2; i++)
         firdecim_q15_reset(st->firdecim[i]);
 
+    st->fm_prev = 0;
+    firdecim_q15_reset(st->fm_firdecim);
+    goertzel_init(&st->fm_pilot, 19000.0f, SAMPLE_RATE / 2, 372 * 4);
+    goertzel_init(&st->fm_not_pilot, 17000.0f, SAMPLE_RATE / 2, 372 / 4);
+    st->fm_pilot_sum = 0;
+    st->fm_pilot_idx = 0;
+    st->fm_not_pilot_sum = 0;
+    st->fm_not_pilot_idx = 0;
+
     acquire_reset(&st->acq);
     decode_reset(&st->decode);
     frame_reset(&st->frame);
@@ -260,7 +309,7 @@ int input_set_decimation(input_t *st, int decimation)
 
 void input_set_freq_offset(input_t *st, float offset)
 {
-    st->phase_increment = cexpf(2 * M_PI * offset / SAMPLE_RATE * I);
+    st->phase_increment = cexpf(2 * M_PI * offset / (SAMPLE_RATE * 2) * I);
     st->phase = st->phase_increment;
 }
 
@@ -272,13 +321,15 @@ void input_init(input_t *st, nrsc5_t *radio, output_t *output)
     st->snr_cb = NULL;
     st->snr_cb_arg = NULL;
 
-    st->phase_increment = cexpf(2 * M_PI * FREQ_OFFSET / SAMPLE_RATE * I);
+    st->phase_increment = cexpf(2 * M_PI * FREQ_OFFSET / (SAMPLE_RATE * 2) * I);
     st->decimation = 2;
     st->decim_log2 = 1;
 
     for (int i = 0; i < MAX_DECIM_LOG2; i++)
         st->firdecim[i] = firdecim_q15_create(decim_taps, sizeof(decim_taps) / sizeof(decim_taps[0]));
     st->snr_fft = fftwf_plan_dft_1d(64, st->snr_fft_in, st->snr_fft_out, FFTW_FORWARD, 0);
+
+    st->fm_firdecim = firdecim_q15_create(decim_taps, sizeof(decim_taps) / sizeof(decim_taps[0]));
 
     acquire_init(&st->acq, st);
     decode_init(&st->decode, st);

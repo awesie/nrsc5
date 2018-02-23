@@ -1,11 +1,67 @@
 <!doctype html>
 <html>
     <body>
+        <div>
+            <button onclick="scan()">Start Scan</button>
+        </div>
+        <div id="scan_results">
+        </div>
         <div id="station">
         </div>
         <div id="programs">
         </div>
         <script>
+            function setFrequency(frequency)
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+                });
+                req.open("POST", "/api/frequency");
+                req.setRequestHeader("Content-type", "application/json");
+                req.send(JSON.stringify({frequency}));
+            }
+            function scan()
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+                    if (resp.success)
+                        queryScan();
+                });
+                req.open("POST", "/api/scan");
+                req.setRequestHeader("Content-type", "application/json");
+                req.send(JSON.stringify({}));
+            }
+            function queryScan()
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+
+                    var html = '';
+                    for (var idx = 0; idx < resp.results.length; idx++)
+                    {
+                        var scan = resp.results[idx];
+                        html += `<div><a href="#" onclick="setFrequency(${scan.frequency})">${scan.frequency}</a> (${scan.name})</div>`;
+                    }
+                    document.getElementById('scan_results').innerHTML = html;
+
+                    if (resp.scanning)
+                        setTimeout(queryScan, 1000);
+                });
+                req.open("GET", "/api/scan");
+                req.send();
+            }
             function constructProgram(program)
             {
                 var html = '';
@@ -115,6 +171,7 @@
                 req.open("GET", "/api/status");
                 req.send();
             }
+            queryScan();
             queryStatus();
         </script>
     </body>

@@ -15,6 +15,7 @@ add_library (
     acquire.c
     decode.c
     frame.c
+    goertzel.c
     input.c
     nrsc5.c
     output.c
@@ -54,6 +55,18 @@ if (WITH_CLI_CLIENT)
         ${THREAD_LIBRARY}
     )
     install (TARGETS app RUNTIME DESTINATION bin)
+
+    add_executable (
+        scan
+        scan.c
+    )
+    set_property (TARGET scan PROPERTY OUTPUT_NAME nrsc5-scan)
+    target_link_libraries (
+        scan
+        nrsc5
+        ${THREAD_LIBRARY}
+    )
+    install (TARGETS scan RUNTIME DESTINATION bin)
 endif()
 
 if (WITH_WEB_SERVER)

@@ -70,6 +70,12 @@ typedef struct {
     uint16_t port_primary_image;
 } server_program_t;
 
+typedef struct scan_result_t {
+    struct scan_result_t *next;
+    float frequency;
+    char *name;
+} scan_result_t;
+
 typedef struct {
     struct lws_context *context;
     nrsc5_t *radio;
@@ -88,6 +94,9 @@ typedef struct {
     float cber;
     float mer_lower;
     float mer_upper;
+
+    int scanning;
+    scan_result_t *scan_result;
 } server_t;
 
 enum
@@ -122,6 +131,7 @@ typedef struct {
 static int http_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 static void server_reset(server_t *server);
 static int server_set_frequency(server_t *server, float frequency);
+static int server_start_scan(server_t *server);
 
 static int force_exit = 0;
 static const struct lws_protocols protocols[] = {
@@ -182,7 +192,7 @@ static server_program_t *server_program_create(int id)
     vorbis_encode_init_vbr(&sp->vi, 2, 44100, 0.4);
     vorbis_analysis_init(&sp->vd, &sp->vi);
     vorbis_block_init(&sp->vd, &sp->vb);
-    
+
     ogg_stream_init(&sp->os, 0);
 
     vorbis_analysis_headerout(&sp->vd, &vc, &header, &header_comm, &header_code);
@@ -550,6 +560,14 @@ static int handle_json_request_post(server_t *server, session_data_t *session, s
         cJSON_AddItemToObject(resp, "success", cJSON_CreateBool(success));
         cJSON_AddItemToObject(resp, "frequency", cJSON_CreateNumber(server->frequency));
     }
+    else if (strcasecmp(session->json.post_uri, "/api/scan") == 0)
+    {
+        int success;
+
+        success = server_start_scan(server);
+        resp = cJSON_CreateObject();
+        cJSON_AddItemToObject(resp, "success", cJSON_CreateBool(success));
+    }
     else
     {
         lws_return_http_status(wsi, HTTP_STATUS_NOT_FOUND, NULL);
@@ -697,6 +715,7 @@ static int handle_json_request(server_t *server, session_data_t *session, struct
         cJSON_AddItemToObject(resp, "cber", cJSON_CreateNumber(server->cber));
         cJSON_AddItemToObject(resp, "mer_lower", cJSON_CreateNumber(server->mer_lower));
         cJSON_AddItemToObject(resp, "mer_upper", cJSON_CreateNumber(server->mer_upper));
+        cJSON_AddItemToObject(resp, "scanning", cJSON_CreateBool(server->scanning));
 
         resp_programs = cJSON_CreateArray();
         for (unsigned int i = 0; i < MAX_RADIO_PROGRAMS; i++)
@@ -724,6 +743,28 @@ static int handle_json_request(server_t *server, session_data_t *session, struct
         }
         cJSON_AddItemToObject(resp, "programs", resp_programs);
 
+        pthread_mutex_unlock(&server->mutex);
+    }
+    else if (strcasecmp(url, "/api/scan") == 0)
+    {
+        cJSON *resp_results;
+
+        pthread_mutex_lock(&server->mutex);
+        resp = cJSON_CreateObject();
+        cJSON_AddItemToObject(resp, "scanning", cJSON_CreateBool(server->scanning));
+        if (server->scanning)
+            cJSON_AddItemToObject(resp, "frequency", cJSON_CreateNumber(server->frequency));
+
+        resp_results = cJSON_CreateArray();
+        for (scan_result_t *scan = server->scan_result; scan != NULL; scan = scan->next)
+        {
+            cJSON *resp_scan = cJSON_CreateObject();
+            cJSON_AddItemToObject(resp_scan, "frequency", cJSON_CreateNumber(scan->frequency));
+            cJSON_AddItemToObject(resp_scan, "name", cJSON_CreateString(scan->name));
+            cJSON_AddItemToArray(resp_results, resp_scan);
+        }
+
+        cJSON_AddItemToObject(resp, "results", resp_results);
         pthread_mutex_unlock(&server->mutex);
     }
     else
@@ -821,7 +862,7 @@ static int handle_static_request(server_t *server, session_data_t *session, stru
 
     if (url[1] == 0)
         url = "/index.html";
-    
+
     if (url[strspn(url, "abcdefghijklmnopqrstuvwxyz0123456789-_./")] != 0)
         goto not_found;
 
@@ -1103,11 +1144,21 @@ static void radio_callback(const nrsc5_event_t *evt, void *opaque)
     }
 }
 
+static void server_reset_scan(server_t *server)
+{
+    while (server->scan_result)
+    {
+        scan_result_t *next = server->scan_result->next;
+        free(server->scan_result->name);
+        free(server->scan_result);
+        server->scan_result = next;
+    }
+}
+
 // This should be called any time we are changing stations.
 static void server_reset(server_t *server)
 {
     pthread_mutex_lock(&server->mutex);
-
     // invalidate streams
     server->generation++;
 
@@ -1126,7 +1177,6 @@ static void server_reset(server_t *server)
     server->cber = 0;
     server->mer_lower = 0;
     server->mer_upper = 0;
-
     pthread_mutex_unlock(&server->mutex);
 
     pthread_mutex_lock(&server->lws_mutex);
@@ -1136,14 +1186,66 @@ static void server_reset(server_t *server)
 
 static int server_set_frequency(server_t *server, float frequency)
 {
-    int success;
+    int success = 0;
 
-    nrsc5_stop(server->radio);
-    success = nrsc5_set_frequency(server->radio, frequency) == 0;
-    if (success)
+    if (!server->scanning)
+    {
+        nrsc5_stop(server->radio);
+        success = nrsc5_set_frequency(server->radio, frequency) == 0;
+        if (success)
+            server_reset(server);
+        nrsc5_get_frequency(server->radio, &server->frequency);
+        nrsc5_start(server->radio);
+    }
+    return success;
+}
+
+static void *server_scan_worker(void *arg)
+{
+    const char *name;
+    server_t *server = arg;
+    scan_result_t *tail = NULL;
+
+    server->frequency = NRSC5_SCAN_BEGIN;
+    while (nrsc5_scan(server->radio, server->frequency, NRSC5_SCAN_END, NRSC5_SCAN_SKIP, &server->frequency, &name) == 0)
+    {
+        scan_result_t *result = malloc(sizeof(scan_result_t));
+        result->next = NULL;
+        result->frequency = server->frequency;
+        result->name = name ? strdup(name) : NULL;
+
+        pthread_mutex_lock(&server->mutex);
+        if (tail)
+            tail->next = result;
+        else
+            server->scan_result = result;
+        tail = result;
+        pthread_mutex_unlock(&server->mutex);
+
+        server->frequency += NRSC5_SCAN_SKIP;
+    }
+
+    server->scanning = 0;
+    if (server->scan_result)
+        server_set_frequency(server, server->scan_result->frequency);
+    return NULL;
+}
+
+static int server_start_scan(server_t *server)
+{
+    int success = 0;
+
+    if (!server->scanning)
+    {
+        pthread_t worker;
+
+        server->scanning = 1;
+        nrsc5_stop(server->radio);
         server_reset(server);
-    nrsc5_get_frequency(server->radio, &server->frequency);
-    nrsc5_start(server->radio);
+        server_reset_scan(server);
+        pthread_create(&worker, NULL, server_scan_worker, server);
+        success = 1;
+    }
 
     return success;
 }

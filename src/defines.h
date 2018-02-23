@@ -13,8 +13,8 @@
 
 #define SNR_FFT_COUNT 256
 
-// Sample rate before decimation
-#define SAMPLE_RATE 1488375
+// Sample rate after decimation
+#define SAMPLE_RATE 744187.5f
 // Tuning offset (fix DC bias)
 #define FREQ_OFFSET 90000
 // FFT length in samples

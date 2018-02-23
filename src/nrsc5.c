@@ -6,20 +6,23 @@
 #include "private.h"
 
 #define RX_CHAN 0
-#define RX_BUFFER_FFT (16384)
+#define RX_BUFFER_FFT 16384
 #define RX_BUFFER (RX_BUFFER_FFT * 4)
-#define RX_TRANSITION_BUFFERS 5
+#define RX_TRANSITION_SAMPLES 81920
 #define RX_TIMEOUT 5000000
 #define AUTO_GAIN_STEP 4.0
+#define AUTO_GAIN_MIN_PILOT 10.0
+#define SCAN_MIN_SNR 2.0
+#define SCAN_AUTO_GAIN_STEP 20.0
 
 struct {
     const char *driver;
     float sample_rate;
     unsigned int decimation;
 } supported_drivers[] = {
-    { "rtlsdr", SAMPLE_RATE, 2 },
-    { "hackrf", SAMPLE_RATE * 4, 8 },
-    { "sdrplay", SAMPLE_RATE * 2, 4 },
+    { "rtlsdr", SAMPLE_RATE * 2, 2 },
+    { "hackrf", SAMPLE_RATE * 8, 8 },
+    { "sdrplay", SAMPLE_RATE * 4, 4 },
     { 0 }
 };
 
@@ -37,15 +40,17 @@ static int find_supported_driver(const char *driver, float *samp_rate, int *deci
     return 1;
 }
 
-static int snr_callback(void *arg, float snr)
+static int snr_callback(void *arg, float snr, float pilot)
 {
     nrsc5_t *st = arg;
     st->auto_gain_snr_ready = 1;
+    if (pilot < AUTO_GAIN_MIN_PILOT)
+        snr = 0.0f;
     st->auto_gain_snr = snr;
     return 1;
 }
 
-static int do_auto_gain(nrsc5_t *st, void *buf)
+static float do_auto_gain(nrsc5_t *st, float step)
 {
     float best_gain = 0, best_snr = 0;
     SoapySDRRange range;
@@ -53,8 +58,7 @@ static int do_auto_gain(nrsc5_t *st, void *buf)
     input_set_snr_callback(&st->input, snr_callback, st);
 
     range = SoapySDRDevice_getGainRange(st->dev, SOAPY_SDR_RX, RX_CHAN);
-    log_debug("Gain range: %f - %f", range.minimum, range.maximum);
-    for (float gain = range.minimum; gain < range.maximum + AUTO_GAIN_STEP / 2; gain += AUTO_GAIN_STEP)
+    for (float gain = range.minimum; gain < range.maximum + step - 0.1; gain += step)
     {
         int ignore;
 
@@ -64,25 +68,32 @@ static int do_auto_gain(nrsc5_t *st, void *buf)
         if (SoapySDRDevice_setGain(st->dev, SOAPY_SDR_RX, RX_CHAN, gain) != 0)
             continue;
 
+        input_reset(&st->input);
         st->auto_gain_snr_ready = 0;
+
         // Two issues on RTL-SDR require ignoring the initial samples:
         //   - after changing the gain there are some samples queued with old gain
         //   - on Debian, changing the gain too quickly results in a freeze
-        ignore = RX_TRANSITION_BUFFERS;
+        ignore = RX_TRANSITION_SAMPLES * st->decimation;
         while (!st->auto_gain_snr_ready)
         {
             int flags;
             long long timeNs;
-            int count = SoapySDRDevice_readStream(st->dev, st->stream, &buf, RX_BUFFER_FFT * st->decimation,
-                    &flags, &timeNs, RX_TIMEOUT);
+            int count = SoapySDRDevice_readStream(st->dev, st->stream, (void**)&st->buffer,
+                    RX_BUFFER_FFT * st->decimation, &flags, &timeNs, RX_TIMEOUT);
             if (count < 0)
                 goto error;
-            if (ignore)
-                ignore--;
+            if (ignore >= count)
+            {
+                ignore -= count;
+            }
             else
-                input_cb(buf, count, &st->input);
+            {
+                input_cb(st->buffer + ignore, count - ignore, &st->input);
+                ignore = 0;
+            }
         }
-        log_debug("AGC: %.2f (%.2f)", gain, st->auto_gain_snr);
+        // log_debug("AGC: %.2f (%.2f)", gain, st->auto_gain_snr);
         if (st->auto_gain_snr > best_snr)
         {
             best_snr = st->auto_gain_snr;
@@ -91,24 +102,45 @@ static int do_auto_gain(nrsc5_t *st, void *buf)
         input_reset(&st->input);
     }
 
-    log_debug("Best gain: %.2f (%.2f)", best_gain, best_snr);
+    log_debug("Gain: %.2f (%.2f)", best_gain, best_snr);
     st->gain = best_gain;
 
     SoapySDRDevice_setGain(st->dev, SOAPY_SDR_RX, RX_CHAN, st->gain);
 
     input_set_snr_callback(&st->input, NULL, NULL);
-    return 0;
+    return best_snr;
 
 error:
     input_set_snr_callback(&st->input, NULL, NULL);
-    return 1;
+    return -1.0;
+}
+
+static void do_work(nrsc5_t *st)
+{
+    int count, flags;
+    long long timeNs;
+
+    if (st->stream)
+    {
+        count = SoapySDRDevice_readStream(st->dev, st->stream, (void **)&st->buffer,
+                st->max_samples, &flags, &timeNs, RX_TIMEOUT);
+        if (count > 0)
+            input_cb(st->buffer, count, &st->input);
+        st->samples += count;
+    }
+    else if (st->iq_file)
+    {
+        count = fread(st->buffer, sizeof(cint16_t), RX_BUFFER * st->decimation, st->iq_file);
+        if (count > 0)
+            input_cb(st->buffer, count, &st->input);
+        else
+            sleep(1);
+    }
 }
 
 static void *worker_thread(void *arg)
 {
     nrsc5_t *st = arg;
-    void *buf = malloc(RX_BUFFER * st->decimation * sizeof(cint16_t));
-    unsigned int ignore = RX_TRANSITION_BUFFERS;
 
     pthread_mutex_lock(&st->worker_mutex);
     while (!st->closed)
@@ -132,11 +164,12 @@ static void *worker_thread(void *arg)
 
                 if (st->auto_gain && st->gain < 0)
                 {
-                    if (do_auto_gain(st, buf) != 0)
+                    if (do_auto_gain(st, AUTO_GAIN_STEP) < 0)
                     {
                         SoapySDRDevice_deactivateStream(st->dev, st->stream, 0, 0);
                         st->stopped = 1;
                         st->worker_stopped = 1;
+                        pthread_cond_broadcast(&st->worker_cond);
                     }
                 }
             }
@@ -149,37 +182,12 @@ static void *worker_thread(void *arg)
         }
         else
         {
-            int count, flags;
-            long long timeNs;
-
             pthread_mutex_unlock(&st->worker_mutex);
-
-            if (st->stream)
-            {
-                count = SoapySDRDevice_readStream(st->dev, st->stream, &buf, RX_BUFFER * st->decimation,
-                        &flags, &timeNs, RX_TIMEOUT);
-                if (count > 0)
-                {
-                    if (ignore > 0)
-                        ignore--;
-                    else
-                        input_cb(buf, count, &st->input);
-                }
-            }
-            else if (st->iq_file)
-            {
-                count = fread(buf, sizeof(cint16_t), RX_BUFFER * st->decimation, st->iq_file);
-                if (count > 0)
-                    input_cb(buf, count, &st->input);
-                else
-                    sleep(1);
-            }
-
+            do_work(st);
             pthread_mutex_lock(&st->worker_mutex);
         }
     }
     pthread_mutex_unlock(&st->worker_mutex);
-    free(buf);
     return NULL;
 }
 
@@ -196,6 +204,9 @@ static void nrsc5_init(nrsc5_t *st)
     output_init(&st->output, st);
     input_init(&st->input, st, &st->output);
     input_set_decimation(&st->input, st->decimation);
+
+    st->max_samples = RX_BUFFER * st->decimation;
+    st->buffer = malloc(st->max_samples * sizeof(cint16_t));
 
     // Create worker thread
     pthread_mutex_init(&st->worker_mutex, NULL);
@@ -219,7 +230,7 @@ int nrsc5_open(nrsc5_t **result, const char *args)
     log_info("Hardware: %s", SoapySDRDevice_getHardwareKey(st->dev));
 
     st->decimation = 2;
-    samp_rate = SAMPLE_RATE * st->decimation / 2;
+    samp_rate = SAMPLE_RATE * st->decimation;
 
     if (find_supported_driver(driver, &samp_rate, &st->decimation) != 0)
         log_warn("Unsupported driver (%s). Please report success or failure along with a debug log.", driver);
@@ -299,11 +310,16 @@ void nrsc5_close(nrsc5_t *st)
         SoapySDRDevice_unmake(st->dev);
     if (st->iq_file)
         fclose(st->iq_file);
+    if (st->buffer)
+        free(st->buffer);
     free(st);
 }
 
 void nrsc5_start(nrsc5_t *st)
 {
+    if (st->scanning)
+        return;
+
     // signal the worker to start
     pthread_mutex_lock(&st->worker_mutex);
     st->stopped = 0;
@@ -313,6 +329,9 @@ void nrsc5_start(nrsc5_t *st)
 
 void nrsc5_stop(nrsc5_t *st)
 {
+    if (st->scanning)
+        return;
+
     // signal the worker to stop
     pthread_mutex_lock(&st->worker_mutex);
     st->stopped = 1;
@@ -386,6 +405,70 @@ void nrsc5_set_auto_gain(nrsc5_t *st, int enabled)
     st->gain = -1;
 }
 
+int nrsc5_scan(nrsc5_t *st, float begin, float end, float skip, float *result, const char **name)
+{
+    int ret = 1;
+
+    if (!st->stopped)
+            return 1;
+
+    if (SoapySDRDevice_activateStream(st->dev, st->stream, 0, 0, 0) != 0)
+        log_error("activate stream failed");
+
+    st->scanning = 1;
+
+    for (float freq = begin; ret && freq <= end; freq += skip)
+    {
+        float snr;
+
+        if (nrsc5_set_frequency(st, freq) != 0)
+            continue;
+        *result = freq;
+
+        snr = do_auto_gain(st, SCAN_AUTO_GAIN_STEP);
+        if (snr == 0)
+            continue;
+
+        snr = do_auto_gain(st, AUTO_GAIN_STEP * 2);
+        log_debug("Station @ %.1f (SNR %.2f)", freq, snr);
+        if (snr < SCAN_MIN_SNR)
+            continue;
+
+        input_reset(&st->input);
+        st->scan_name = NULL;
+        st->scan_sync = 0;
+        st->samples = 0;
+
+        while (st->samples < SAMPLE_RATE * st->decimation * 30)
+        {
+            do_work(st);
+
+            // Give up if we haven't found any signal for lock on
+            if (!st->scan_sync && st->samples >= SAMPLE_RATE * st->decimation * 10)
+                break;
+
+            // Stop once we know the station name
+            if (st->scan_name && st->scan_name[0])
+                break;
+        }
+
+        if (!st->scan_sync)
+            continue;
+
+        if (st->scan_name)
+            log_info("%s @ %.1f (SNR %.2f)", st->scan_name, freq, snr);
+
+        *name = st->scan_name;
+        ret = 0;
+    }
+
+    if (st->stream)
+        SoapySDRDevice_deactivateStream(st->dev, st->stream, 0, 0);
+
+    st->scanning = 0;
+    return ret;
+}
+
 void nrsc5_set_callback(nrsc5_t *st, nrsc5_callback_t callback, void *opaque)
 {
     pthread_mutex_lock(&st->worker_mutex);
@@ -396,6 +479,9 @@ void nrsc5_set_callback(nrsc5_t *st, nrsc5_callback_t callback, void *opaque)
 
 void nrsc5_report(nrsc5_t *st, const nrsc5_event_t *evt)
 {
+    if (st->scanning)
+        return;
+
     if (st->callback)
         st->callback(evt, st->callback_opaque);
 }
@@ -413,6 +499,9 @@ void nrsc5_report_iq(nrsc5_t *st, const void *data, size_t count)
 void nrsc5_report_sync(nrsc5_t *st)
 {
     nrsc5_event_t evt;
+
+    if (st->scanning)
+        st->scan_sync = 1;
 
     evt.event = NRSC5_EVENT_SYNC;
     nrsc5_report(st, &evt);
@@ -583,6 +672,9 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
 void nrsc5_report_sis(nrsc5_t *st, pids_t *pids)
 {
     nrsc5_event_t evt;
+
+    if (st->scanning)
+        st->scan_name = pids->short_name;
 
     evt.event = NRSC5_EVENT_SIS;
     evt.sis.name = pids->short_name;
