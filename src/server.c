@@ -8,6 +8,7 @@
 #include <ogg/ogg.h>
 #include <vorbis/vorbisenc.h>
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,11 +21,16 @@
     #define mkdir(x,y) _mkdir(x)
 #endif
 
-#define AUDIO_FRAME_SAMPLES 2048
+#define AUDIO_FRAME_SAMPLES 4096
 #define MAX_RADIO_PROGRAMS 8
 // Pages are ~4KB, so the total buffer is ~128KB
 #define BUFFER_SIZE 32
 #define MAX_POST_SIZE 1024
+
+typedef struct audio_buffer_t {
+    struct audio_buffer_t *next;
+    int16_t data[AUDIO_FRAME_SAMPLES];
+} audio_buffer_t;
 
 typedef struct server_id3_t {
     struct server_id3_t *next;
@@ -51,6 +57,13 @@ typedef struct {
 
     uint8_t *header;
     size_t header_len;
+
+    pthread_t worker;
+    int worker_stop;
+    pthread_cond_t cond;
+    pthread_mutex_t mutex;
+    audio_buffer_t *free_list;
+    audio_buffer_t *audio_head, *audio_tail;
 
     int page_idx;
     int page_len;
@@ -99,6 +112,11 @@ typedef struct {
     scan_result_t *scan_result;
 } server_t;
 
+typedef struct {
+    server_t *server;
+    server_program_t *sp;
+} server_program_arg_t;
+
 enum
 {
     SESSION_INVALID = 0,
@@ -132,6 +150,7 @@ static int http_callback(struct lws *wsi, enum lws_callback_reasons reason, void
 static void server_reset(server_t *server);
 static int server_set_frequency(server_t *server, float frequency);
 static int server_start_scan(server_t *server);
+static void *server_program_worker(void *arg);
 
 static int force_exit = 0;
 static const struct lws_protocols protocols[] = {
@@ -178,7 +197,7 @@ static const char *mime_to_string(uint32_t mime)
         return "";
 }
 
-static server_program_t *server_program_create(int id)
+static server_program_t *server_program_create(server_t * server, int id)
 {
     ogg_packet header, header_comm, header_code;
     ogg_page og;
@@ -222,6 +241,22 @@ static server_program_t *server_program_create(int id)
     sp->header[sp->header_len++] = '\r';
     sp->header[sp->header_len++] = '\n';
 
+    sp->audio_head = sp->audio_tail = NULL;
+    sp->free_list = NULL;
+    for (int i = 0; i < 64; i++)
+    {
+        audio_buffer_t *ab = malloc(sizeof(audio_buffer_t));
+        ab->next = sp->free_list;
+        sp->free_list = ab;
+    }
+
+    pthread_mutex_init(&sp->mutex, NULL);
+    pthread_cond_init(&sp->cond, NULL);
+    server_program_arg_t *arg = malloc(sizeof(server_program_arg_t));
+    arg->server = server;
+    arg->sp = sp;
+    pthread_create(&sp->worker, NULL, server_program_worker, arg);
+
     return sp;
 }
 
@@ -238,10 +273,18 @@ static void server_id3_destroy(server_id3_t *id3)
 
 static void server_program_destroy(server_program_t *sp)
 {
+    audio_buffer_t *ab;
     server_id3_t *id3;
 
     if (sp == NULL)
         return;
+
+    pthread_mutex_lock(&sp->mutex);
+    sp->worker_stop = 1;
+    pthread_cond_broadcast(&sp->cond);
+    pthread_mutex_unlock(&sp->mutex);
+
+    pthread_join(sp->worker, NULL);
 
     ogg_stream_clear(&sp->os);
     vorbis_info_clear(&sp->vi);
@@ -259,6 +302,22 @@ static void server_program_destroy(server_program_t *sp)
         server_id3_t *next = id3->next;
         server_id3_destroy(id3);
         id3 = next;
+    }
+
+    ab = sp->free_list;
+    while (ab)
+    {
+        audio_buffer_t *next = ab->next;
+        free(ab);
+        ab = next;
+    }
+
+    ab = sp->audio_head;
+    while (ab)
+    {
+        audio_buffer_t *next = ab->next;
+        free(ab);
+        ab = next;
     }
 
     free(sp);
@@ -308,11 +367,13 @@ static int server_program_update_id3(server_t *server, server_program_t *sp, con
         id3->xhdr_mime = evt->id3.xhdr.mime;
         id3->xhdr_lot = evt->id3.xhdr.lot;
 
+        pthread_mutex_lock(&sp->mutex);
         if (sp->id3_tail)
             sp->id3_tail->next = id3;
         else
             sp->id3_head = id3;
         sp->id3_tail = id3;
+        pthread_mutex_unlock(&sp->mutex);
     }
 
     return updated;
@@ -328,7 +389,7 @@ static void server_program_expire_id3(server_program_t *sp, uint64_t granule)
     }
 }
 
-static void server_program_push_page(server_t *server, server_program_t *sp, ogg_page *og)
+static void server_program_push_page(server_program_t *sp, ogg_page *og)
 {
     uint8_t *data;
     size_t len = 0;
@@ -342,6 +403,7 @@ static void server_program_push_page(server_t *server, server_program_t *sp, ogg
     data[len++] = '\r';
     data[len++] = '\n';
 
+    pthread_mutex_lock(&sp->mutex);
     if (sp->page_len == BUFFER_SIZE)
     {
         server_program_expire_id3(sp, sp->page[0].granule);
@@ -355,9 +417,10 @@ static void server_program_push_page(server_t *server, server_program_t *sp, ogg
     sp->page[sp->page_len].data = data;
     sp->page[sp->page_len].len = len;
     sp->page_len++;
+    pthread_mutex_unlock(&sp->mutex);
 }
 
-static int server_program_push(server_t *server, server_program_t *sp, const int16_t *samples, size_t count)
+static int server_program_encode(server_program_t *sp, const int16_t *samples, size_t count)
 {
     int should_notify = 0;
     float **anabuf;
@@ -385,13 +448,75 @@ static int server_program_push(server_t *server, server_program_t *sp, const int
             {
                 if (ogg_stream_pageout(&sp->os, &og) == 0)
                     break;
-                server_program_push_page(server, sp, &og);
+                server_program_push_page(sp, &og);
                 should_notify = 1;
             }
         }
     }
 
     return should_notify;
+}
+
+static void *server_program_worker(void *arg_)
+{
+    server_program_arg_t *arg = arg_;
+    server_program_t *sp = arg->sp;
+    server_t *server = arg->server;
+    free(arg);
+
+    pthread_mutex_lock(&sp->mutex);
+    while (!sp->worker_stop)
+    {
+        audio_buffer_t *ab;
+
+        while (!sp->worker_stop && sp->audio_head == NULL)
+            pthread_cond_wait(&sp->cond, &sp->mutex);
+
+        if (sp->worker_stop)
+            break;
+
+        ab = sp->audio_head;
+        sp->audio_head = ab->next;
+        if (sp->audio_head == NULL)
+            sp->audio_tail = NULL;
+        pthread_mutex_unlock(&sp->mutex);
+
+        if (server_program_encode(sp, ab->data, AUDIO_FRAME_SAMPLES))
+        {
+            pthread_mutex_lock(&server->lws_mutex);
+            lws_callback_on_writable_all_protocol(server->context, &protocols[0]);
+            pthread_mutex_unlock(&server->lws_mutex);
+        }
+
+        pthread_mutex_lock(&sp->mutex);
+        ab->next = sp->free_list;
+        sp->free_list = ab;
+    }
+    pthread_mutex_unlock(&sp->mutex);
+
+    return NULL;
+}
+
+static void server_program_push(server_program_t *sp, const int16_t *samples, size_t count)
+{
+    audio_buffer_t *ab;
+
+    assert(count == AUDIO_FRAME_SAMPLES);
+
+    pthread_mutex_lock(&sp->mutex);
+    ab = sp->free_list;
+    sp->free_list = ab->next;
+
+    ab->next = NULL;
+    memcpy(ab->data, samples, AUDIO_FRAME_SAMPLES * sizeof(int16_t));
+
+    if (sp->audio_tail)
+        sp->audio_tail->next = ab;
+    else
+        sp->audio_head = ab;
+    sp->audio_tail = ab;
+    pthread_cond_broadcast(&sp->cond);
+    pthread_mutex_unlock(&sp->mutex);
 }
 
 int lws_header_table_detach(struct lws *wsi, int autoservice);
@@ -500,20 +625,28 @@ static int handle_stream_writeable(server_t *server, session_data_t *session, st
     if (session->stream.sent_header)
     {
         int page_idx = session->stream.page_idx;
+        pthread_mutex_lock(&sp->mutex);
         if (page_idx == 0)
             page_idx = sp->page_idx;
         if (page_idx < sp->page_idx)
+        {
+            pthread_mutex_unlock(&sp->mutex);
             goto error;
+        }
         if (page_idx < sp->page_idx + sp->page_len)
         {
             if (lws_write(wsi, sp->page[page_idx - sp->page_idx].data, sp->page[page_idx - sp->page_idx].len, LWS_WRITE_HTTP) < 0)
+            {
+                pthread_mutex_unlock(&sp->mutex);
                 goto error;
+            }
             lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT, 5);
             session->stream.page_idx = page_idx + 1;
         }
 
         if (session->stream.page_idx < sp->page_idx + sp->page_len)
             lws_callback_on_writable(wsi);
+        pthread_mutex_unlock(&sp->mutex);
     }
     else
     {
@@ -726,6 +859,7 @@ static int handle_json_request(server_t *server, session_data_t *session, struct
             if (sp == NULL)
                 continue;
 
+            pthread_mutex_lock(&sp->mutex);
             resp_id3 = cJSON_CreateArray();
             for (server_id3_t *id3 = sp->id3_head; id3 != NULL; id3 = id3->next)
                 cJSON_AddItemToArray(resp_id3, server_id3_to_json(server, sp, id3));
@@ -740,6 +874,7 @@ static int handle_json_request(server_t *server, session_data_t *session, struct
             cJSON_AddItemToObject(resp_program, "audio", cJSON_CreateString(path));
 
             cJSON_AddItemToArray(resp_programs, resp_program);
+            pthread_mutex_unlock(&sp->mutex);
         }
         cJSON_AddItemToObject(resp, "programs", resp_programs);
 
@@ -998,7 +1133,7 @@ static server_program_t *ensure_server_program(server_t *server, int program)
 
     sp = server->program[program];
     if (sp == NULL)
-        server->program[program] = sp = server_program_create(program);
+        server->program[program] = sp = server_program_create(server, program);
     return sp;
 }
 
@@ -1061,7 +1196,7 @@ static void radio_callback(const nrsc5_event_t *evt, void *opaque)
         break;
     case NRSC5_EVENT_AUDIO:
         sp = ensure_server_program(server, evt->audio.program);
-        should_notify = server_program_push(server, sp, evt->audio.data, evt->audio.count);
+        server_program_push(sp, evt->audio.data, evt->audio.count);
         break;
     case NRSC5_EVENT_SYNC:
         server->sync = 1;
