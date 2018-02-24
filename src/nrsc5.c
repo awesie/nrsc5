@@ -284,7 +284,7 @@ int nrsc5_open_iq(nrsc5_t **result, const char *path)
     st->decimation = 2;
     st->iq_file = fp;
     nrsc5_init(st);
-    input_set_freq_offset(&st->input, 0.0f);
+    input_set_offset_tuning(&st->input, 0);
 
     *result = st;
     return 0;

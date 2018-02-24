@@ -24,7 +24,10 @@ typedef struct input_t
     nrsc5_t *radio;
     output_t *output;
 
-    float complex phase, phase_increment;
+    int offset_tuning;
+    cint16_t phase, phase_increment;
+    unsigned phase_idx;
+
     int decimation;
     int decim_log2;
     firdecim_q15 firdecim[MAX_DECIM_LOG2];
@@ -55,7 +58,7 @@ void input_init(input_t *st, nrsc5_t *radio, output_t *output);
 void input_reset(input_t *st);
 void input_cb(cint16_t *, uint32_t, void *);
 int input_set_decimation(input_t *st, int);
-void input_set_freq_offset(input_t *st, float offset);
+void input_set_offset_tuning(input_t *st, int);
 void input_set_snr_callback(input_t *st, input_snr_cb_t cb, void *);
 void input_set_skip(input_t *st, unsigned int skip);
 void input_pdu_push(input_t *st, uint8_t *pdu, unsigned int len, unsigned int program);

@@ -15,8 +15,10 @@
 
 // Sample rate after decimation
 #define SAMPLE_RATE 744187.5f
+// Common factor of 2*SAMPLE_RATE and FREQ_OFFSET
+#define FREQ_OFFSET_FACTOR 525.0f
 // Tuning offset (fix DC bias)
-#define FREQ_OFFSET 90000
+#define FREQ_OFFSET (190.0 * FREQ_OFFSET_FACTOR)
 // FFT length in samples
 #define FFT 2048
 // cyclic preflex length in samples
@@ -62,6 +64,14 @@ static inline cint16_t cf_to_cq15(float complex x)
 static inline float complex cq15_to_cf(cint16_t cq15)
 {
     return CMPLXF((float)cq15.r / 32767.0f, (float)cq15.i / 32767.0f);
+}
+
+static inline cint16_t cq15_mul(cint16_t a, cint16_t b)
+{
+    cint16_t x;
+    x.r = (a.r * b.r - a.i * b.i) >> 15;
+    x.i = (a.r * b.i + a.i * b.r) >> 15;
+    return x;
 }
 
 static inline float normf(float complex v)

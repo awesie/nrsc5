@@ -192,13 +192,22 @@ void input_cb(cint16_t *buf, uint32_t len, void *arg)
         len /= 2;
     }
 
-    // correct frequency offset
-    for (i = 0; i < len; i++)
+    if (st->offset_tuning)
     {
-        st->phase *= st->phase_increment;
-        buf[i] = cf_to_cq15(cq15_to_cf(buf[i]) * st->phase);
+        // Correct frequency offset
+        for (i = 0; i < len; i++)
+        {
+            st->phase = cq15_mul(st->phase, st->phase_increment);
+            buf[i] = cq15_mul(buf[i], st->phase);
+
+            // Prevent error accumulation by resetting after one cycle.
+            if (++st->phase_idx == (unsigned int)(SAMPLE_RATE * 2 / FREQ_OFFSET_FACTOR))
+            {
+                st->phase_idx = 0;
+                st->phase = st->phase_increment;
+            }
+        }
     }
-    st->phase /= cabsf(st->phase);
 
     if (st->snr_cb)
     {
@@ -239,12 +248,6 @@ void input_cb(cint16_t *buf, uint32_t len, void *arg)
         x[1].r = buf[i + 1].r;
         x[1].i = -buf[i + 1].i;
 
-        if (x[0].r >= 0x7E00 || x[0].i >= 0x7E00 || x[1].r >= 0x7E00 || x[1].i >= 0x7E00 ||
-            x[0].r <= -0x7E00 || x[0].i <= -0x7E00 || x[1].r <= -0x7E00 || x[1].i <= -0x7E00)
-        {
-            log_warn("Clipping");
-        }
-
         halfband_q15_execute(st->firdecim[0], x, &y);
         st->buffer[new_avail++] = y;
     }
@@ -273,6 +276,7 @@ void input_reset(input_t *st)
     st->snr_cnt = 0;
 
     st->phase = st->phase_increment;
+    st->phase_idx = 0;
     for (int i = 0; i < MAX_DECIM_LOG2; i++)
         firdecim_q15_reset(st->firdecim[i]);
 
@@ -307,10 +311,9 @@ int input_set_decimation(input_t *st, int decimation)
     return 0;
 }
 
-void input_set_freq_offset(input_t *st, float offset)
+void input_set_offset_tuning(input_t *st, int enabled)
 {
-    st->phase_increment = cexpf(2 * M_PI * offset / (SAMPLE_RATE * 2) * I);
-    st->phase = st->phase_increment;
+    st->offset_tuning = enabled;
 }
 
 void input_init(input_t *st, nrsc5_t *radio, output_t *output)
@@ -321,7 +324,9 @@ void input_init(input_t *st, nrsc5_t *radio, output_t *output)
     st->snr_cb = NULL;
     st->snr_cb_arg = NULL;
 
-    st->phase_increment = cexpf(2 * M_PI * FREQ_OFFSET / (SAMPLE_RATE * 2) * I);
+    st->offset_tuning = 1;
+    st->phase_increment = cf_to_cq15(cexpf(2 * M_PI * FREQ_OFFSET / (SAMPLE_RATE * 2) * I));
+
     st->decimation = 2;
     st->decim_log2 = 1;
 
