@@ -21,7 +21,7 @@ struct {
     unsigned int decimation;
 } supported_drivers[] = {
     { "rtlsdr", SAMPLE_RATE * 2, 2 },
-    { "hackrf", SAMPLE_RATE * 8, 8 },
+    { "hackrf", SAMPLE_RATE * 4, 4 },
     { "sdrplay", SAMPLE_RATE * 4, 4 },
     { 0 }
 };
