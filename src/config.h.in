@@ -23,3 +23,15 @@
 #include <stdlib.h>
 char *strndup(char const *s, size_t n);
 #endif
+
+/* For speex resampler: */
+#define EXPORT
+#define OUTSIDE_SPEEX
+#define RANDOM_PREFIX nrsc5
+#define FLOATING_POINT
+#ifdef HAVE_SSE2
+    #define _USE_SSE
+#endif
+#ifdef HAVE_NEON
+    #define _USE_NEON
+#endif

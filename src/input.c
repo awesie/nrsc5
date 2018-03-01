@@ -25,6 +25,8 @@
 
 #define INPUT_BUF_LEN (2160 * 512)
 #define FM_PILOT_LIMIT 1000.0
+#define FM_DEMOD_DAMPING (sqrtf(2.0f) / 2.0f)
+#define FM_DEMOD_LOOP_BW (1.0f / 20.0f)
 
 /*
  * GNU Radio Filter Design Tool
@@ -40,6 +42,54 @@ static float decim_taps[] = {
     0.032919470220804214,
     -0.00410953676328063
 };
+
+static float input_fm_demod(input_t *st, cint16_t x)
+{
+    const float max_freq = 2 * M_PI * 90000 / (SAMPLE_RATE / 2);
+    const float damping = FM_DEMOD_DAMPING;
+    const float loop_bw = 2 * M_PI * FM_DEMOD_LOOP_BW;
+    const float alpha = 4 * damping * loop_bw / (1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw);
+    const float beta = 4 * loop_bw * loop_bw / (1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw);
+    float y;
+
+#if 1
+    y = st->fm_demod_freq / (M_PI / 2);
+
+    float error = cargf(cq15_to_cf(x)) - st->fm_demod_phase;
+
+    if (error > M_PI)
+        error -= 2 * M_PI;
+    if (error < -M_PI)
+        error += 2 * M_PI;
+
+    st->fm_demod_freq += beta * error;
+    st->fm_demod_phase += st->fm_demod_freq + alpha * error;
+
+    while (st->fm_demod_phase > 2 * M_PI)
+        st->fm_demod_phase -= 2 * M_PI;
+    while (st->fm_demod_phase < -2 * M_PI)
+        st->fm_demod_phase += 2 * M_PI;
+
+    if (st->fm_demod_freq > max_freq)
+        st->fm_demod_freq = max_freq;
+    else if (st->fm_demod_freq < -max_freq)
+        st->fm_demod_freq = -max_freq;
+
+#else
+    // Assuming that compiler is "normal", limit input to [-1, 0, 1].
+    x.r >>= 15;
+    x.i >>= 15;
+
+    // Demodulator based on goo.gl/JH9VJo.
+    // We scale range from [-2, 2] -> [-1, 1].
+    y = 0.5f * ((x.r - st->fm_demod_q0.r) * st->fm_demod_q1.i - (x.i - st->fm_demod_q0.i) * st->fm_demod_q1.r);
+
+    st->fm_demod_q0 = st->fm_demod_q1;
+    st->fm_demod_q1 = x;
+#endif
+
+    return y;
+}
 
 static void input_push_to_acquire(input_t *st)
 {
@@ -60,9 +110,9 @@ static void input_push_to_acquire(input_t *st)
     st->used += acquire_push(&st->acq, &st->buffer[st->used], st->avail - st->used);
 }
 
-void input_pdu_push(input_t *st, uint8_t *pdu, unsigned int len, unsigned int program)
+void input_pdu_push(input_t *st, uint8_t *pdu, unsigned int len, unsigned int program, int gain)
 {
-    output_push(st->output, pdu, len, program);
+    output_push(st->output, pdu, len, program, gain);
 }
 
 void input_set_skip(input_t *st, unsigned int skip)
@@ -92,6 +142,8 @@ static void measure_snr(input_t *st, cint16_t *buf, uint32_t len)
     for (i = 0; i < len; i += 4)
     {
         cint16_t x[2], y[2], z;
+        float angle, mag, mag2;
+
         x[0] = buf[i];
         x[1] = buf[i + 1];
         halfband_q15_execute(st->firdecim[0], x, &y[0]);
@@ -100,11 +152,7 @@ static void measure_snr(input_t *st, cint16_t *buf, uint32_t len)
         halfband_q15_execute(st->firdecim[0], x, &y[1]);
         halfband_q15_execute(st->fm_firdecim, y, &z);
 
-        float complex fz = cq15_to_cf(z);
-        float angle = cargf(fz * conjf(st->fm_prev));
-        st->fm_prev = fz;
-
-        float mag, mag2;
+        angle = input_fm_demod(st, z);
         if (goertzel_execute(&st->fm_pilot, angle / M_PI, &mag))
         {
             mag = fminf(FM_PILOT_LIMIT, mag);
@@ -241,15 +289,28 @@ void input_cb(cint16_t *buf, uint32_t len, void *arg)
 
     for (i = 0; i < len; i += 2)
     {
-        cint16_t x[2], y;
+        cint16_t y;
 
-        x[0].r = buf[i].r;
-        x[0].i = -buf[i].i;
-        x[1].r = buf[i + 1].r;
-        x[1].i = -buf[i + 1].i;
+        halfband_q15_execute(st->firdecim[0], &buf[i], &y);
+        st->buffer[new_avail++] = (cint16_t){ y.r, -y.i };
+    }
 
-        halfband_q15_execute(st->firdecim[0], x, &y);
-        st->buffer[new_avail++] = y;
+    static FILE *fmout;
+    if (fmout == NULL)
+        fmout = fopen("/tmp/fm.raw", "wb");
+
+    for (i = st->avail; i < new_avail; i += 4)
+    {
+        float x[2];
+        cint16_t z;
+
+        halfband_q15_execute(st->fm_firdecim, &st->buffer[i], &z);
+        x[0] = input_fm_demod(st, z);
+
+        halfband_q15_execute(st->fm_firdecim, &st->buffer[i + 2], &z);
+        x[1] = input_fm_demod(st, z);
+
+        fm_audio_push(&st->fm_audio, x);
     }
 
     st->avail = new_avail;
@@ -280,8 +341,9 @@ void input_reset(input_t *st)
     for (int i = 0; i < MAX_DECIM_LOG2; i++)
         firdecim_q15_reset(st->firdecim[i]);
 
-    st->fm_prev = 0;
     firdecim_q15_reset(st->fm_firdecim);
+    st->fm_demod_phase = 0;
+    st->fm_demod_freq = 0;
     goertzel_init(&st->fm_pilot, 19000.0f, SAMPLE_RATE / 2, 372 * 4);
     goertzel_init(&st->fm_not_pilot, 17000.0f, SAMPLE_RATE / 2, 372 / 4);
     st->fm_pilot_sum = 0;
@@ -333,13 +395,13 @@ void input_init(input_t *st, nrsc5_t *radio, output_t *output)
     for (int i = 0; i < MAX_DECIM_LOG2; i++)
         st->firdecim[i] = firdecim_q15_create(decim_taps, sizeof(decim_taps) / sizeof(decim_taps[0]));
     st->snr_fft = fftwf_plan_dft_1d(64, st->snr_fft_in, st->snr_fft_out, FFTW_FORWARD, 0);
-
     st->fm_firdecim = firdecim_q15_create(decim_taps, sizeof(decim_taps) / sizeof(decim_taps[0]));
 
     acquire_init(&st->acq, st);
     decode_init(&st->decode, st);
     frame_init(&st->frame, st);
     sync_init(&st->sync, st);
+    fm_audio_init(&st->fm_audio, st->radio);
 
     input_reset(st);
 }

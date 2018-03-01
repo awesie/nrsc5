@@ -11,6 +11,12 @@
 #include "input.h"
 #include "output.h"
 
+typedef struct audio_buffer_t
+{
+    struct audio_buffer_t *next;
+    int16_t data[4096];
+} audio_buffer_t;
+
 struct nrsc5_t
 {
     SoapySDRDevice *dev;
@@ -38,6 +44,13 @@ struct nrsc5_t
     pthread_t worker;
     pthread_mutex_t worker_mutex;
     pthread_cond_t worker_cond;
+
+    audio_buffer_t *ab_free_list;
+    audio_buffer_t *ab_head, *ab_tail;
+    unsigned int ab_count, ab_skip;
+    unsigned int sample_offset;
+    unsigned int digital_started;
+    unsigned int digital_fade;
 
     input_t input;
     output_t output;

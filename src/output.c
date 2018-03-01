@@ -30,12 +30,15 @@ static uint16_t swap16(uint16_t x)
     return (x >> 8) | (x << 8);
 }
 
-void output_push(output_t *st, uint8_t *pkt, unsigned int len, unsigned int program)
+void output_push(output_t *st, uint8_t *pkt, unsigned int len, unsigned int program, int gain)
 {
     nrsc5_report_hdc(st->radio, program, pkt, len);
 
+    if (pkt == NULL)
+        goto error;
+
 #ifdef USE_FAAD2
-    void *buffer;
+    int16_t *buffer;
     NeAACDecFrameInfo info;
 
     if (!st->aacdec[program])
@@ -49,8 +52,27 @@ void output_push(output_t *st, uint8_t *pkt, unsigned int len, unsigned int prog
         log_error("Decode error: %s", NeAACDecGetErrorMessage(info.error));
 
     if (info.error == 0 && info.samples > 0)
+    {
+        float scale = powf(10.0f, gain / 20.0f);
+        // apply gain
+        for (int i = 0; i < info.samples; i++)
+        {
+            float x = buffer[i] * scale;
+            if (x < INT16_MIN)
+                x = INT16_MIN;
+            else if (x > INT16_MAX)
+                x = INT16_MAX;
+            buffer[i] = x;
+        }
+
         nrsc5_report_audio(st->radio, program, buffer, info.samples);
+        return;
+    }
 #endif
+
+error:
+    nrsc5_report_audio(st->radio, program, NULL, 4096);
+    return;
 }
 
 static void aas_free_lot(aas_file_t *file)

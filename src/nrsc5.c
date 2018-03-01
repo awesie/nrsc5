@@ -15,6 +15,16 @@
 #define SCAN_MIN_SNR 2.0
 #define SCAN_AUTO_GAIN_STEP 20.0
 
+#define AUDIO_FRAME_SAMPLES 2048
+// Tad = 96 audio frames
+// Digital decoder delay = 32 audio frames
+#define BLEND_MIN_FRAMES 96
+#define BLEND_MAX_FRAMES 128
+#define BLEND_CORR_FRAMES 32
+#define BLEND_CORR_SAMPLES 256
+// First N frames of the digital audio may be distorted
+#define BLEND_DIGITAL_SKIP 16
+
 struct {
     const char *driver;
     float sample_rate;
@@ -212,6 +222,17 @@ static void nrsc5_init(nrsc5_t *st)
     pthread_mutex_init(&st->worker_mutex, NULL);
     pthread_cond_init(&st->worker_cond, NULL);
     pthread_create(&st->worker, NULL, worker_thread, st);
+
+    st->ab_free_list = NULL;
+    for (int i = 0; i < BLEND_MAX_FRAMES; i++)
+    {
+        audio_buffer_t *ab = malloc(sizeof(audio_buffer_t));
+        ab->next = st->ab_free_list;
+        st->ab_free_list = ab;
+    }
+    st->ab_head = st->ab_tail = NULL;
+    st->ab_count = 0;
+    st->ab_skip = BLEND_DIGITAL_SKIP;
 }
 
 int nrsc5_open(nrsc5_t **result, const char *args)
@@ -526,15 +547,180 @@ void nrsc5_report_hdc(nrsc5_t *st, unsigned int program, const uint8_t *data, si
     nrsc5_report(st, &evt);
 }
 
-void nrsc5_report_audio(nrsc5_t *st, unsigned int program, const int16_t *data, size_t count)
+static void nrsc5_reset_blend(nrsc5_t *st)
 {
+    audio_buffer_t *ab;
+
+    st->ab_skip = BLEND_DIGITAL_SKIP;
+    st->ab_count = 0;
+    st->digital_started = 0;
+
+    while (st->ab_head)
+    {
+        ab = st->ab_head;
+        st->ab_head = ab->next;
+        ab->next = st->ab_free_list;
+        st->ab_free_list = ab;
+    }
+    st->ab_tail = NULL;
+}
+
+static void nrsc5_report_audio_blend(nrsc5_t *st, unsigned int program, const int16_t *analog, size_t count)
+{
+    const int16_t *data;
+    audio_buffer_t *ab;
     nrsc5_event_t evt;
+
+    // If this is the first digital samples, we need to cross correlate with the analog
+    // to figure out the sample offset.
+    // TODO Crossfade from analog -> digital.
+    if (!st->digital_started)
+    {
+        int16_t tmp[AUDIO_FRAME_SAMPLES * BLEND_CORR_FRAMES];
+
+        while (st->ab_count > BLEND_MIN_FRAMES)
+        {
+            ab = st->ab_head;
+            st->ab_head = ab->next;
+            st->ab_count--;
+            ab->next = st->ab_free_list;
+            st->ab_free_list = ab;
+        }
+
+        ab = st->ab_head;
+        for (int j = 0; j < BLEND_CORR_FRAMES; j++)
+        {
+            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++)
+                tmp[j * AUDIO_FRAME_SAMPLES + i] = (ab->data[i * 2] + ab->data[i * 2 + 1]) / sqrtf(2.0f);
+            ab = ab->next;
+        }
+
+        // cross-correlation
+        int deviation = -1;
+        float max_sum = 0.0;
+        for (int j = 0; j < AUDIO_FRAME_SAMPLES * BLEND_CORR_FRAMES - BLEND_CORR_SAMPLES; j++)
+        {
+            float sum = 0.0;
+            for (int i = 0; i < BLEND_CORR_SAMPLES; i++)
+                sum += tmp[j + i] * analog[i * 2];
+            if (sum > max_sum)
+            {
+                deviation = j;
+                max_sum = sum;
+            }
+        }
+
+        log_debug("Analog sample offset: %d", deviation);
+
+        while (deviation > AUDIO_FRAME_SAMPLES)
+        {
+            ab = st->ab_head;
+            st->ab_head = ab->next;
+            st->ab_count--;
+            ab->next = st->ab_free_list;
+            st->ab_free_list = ab;
+
+            deviation -= AUDIO_FRAME_SAMPLES;
+        }
+        st->sample_offset = deviation;
+
+        ab = st->ab_head;
+        st->ab_head = ab->next;
+        st->ab_count--;
+        data = ab->data + st->sample_offset;
+        count = (AUDIO_FRAME_SAMPLES - st->sample_offset) * 2;
+
+        st->digital_started = 1;
+    }
+    else
+    {
+        ab = st->ab_head;
+        st->ab_head = ab->next;
+        st->ab_count--;
+        data = ab->data;
+    }
+
+#if 0
+#define BLEND_FADE_SAMPLES (4 * 44100)
+    for (unsigned int i = 0; st->digital_fade < BLEND_FADE_SAMPLES && i < AUDIO_FRAME_SAMPLES; i++)
+    {
+        unsigned int digital_idx = st->sample_offset + i;
+        float a = st->digital_fade++ / (float)BLEND_FADE_SAMPLES;
+        a = 2 * a - 1.0f;
+        if (digital_idx < AUDIO_FRAME_SAMPLES)
+        {
+            ab->data[digital_idx * 2] = ab->data[digital_idx * 2] * sqrtf(0.5f * (1.0f + a)) + analog[i * 2] * sqrtf(0.5f * (1.0f - a));
+            ab->data[digital_idx * 2 + 1] = ab->data[digital_idx * 2 + 1] * sqrtf(0.5f * (1.0f + a)) + analog[i * 2 + 1] * sqrtf(0.5f * (1.0f - a));
+        }
+        else
+        {
+            ab->next->data[(digital_idx - AUDIO_FRAME_SAMPLES) * 2] = ab->next->data[(digital_idx - AUDIO_FRAME_SAMPLES) * 2] * sqrtf(0.5f * (1.0f + a)) + analog[i * 2] * sqrtf(0.5f * (1.0f - a));
+            ab->next->data[(digital_idx - AUDIO_FRAME_SAMPLES) * 2 + 1] = ab->next->data[(digital_idx - AUDIO_FRAME_SAMPLES) * 2 + 1] * sqrtf(0.5f * (1.0f + a)) + analog[i * 2 + 1] * sqrtf(0.5f * (1.0f - a));
+        }
+    }
+#endif
 
     evt.event = NRSC5_EVENT_AUDIO;
     evt.audio.program = program;
     evt.audio.data = data;
     evt.audio.count = count;
     nrsc5_report(st, &evt);
+
+    ab->next = st->ab_free_list;
+    st->ab_free_list = ab;
+}
+
+void nrsc5_report_audio(nrsc5_t *st, unsigned int program, const int16_t *data, size_t count)
+{
+    static const int16_t zero_data[AUDIO_FRAME_SAMPLES * 2];
+    audio_buffer_t *ab;
+    nrsc5_event_t evt;
+
+    if (data == NULL)
+        data = zero_data;
+
+    if (program == NRSC5_PROGRAM_ANALOG)
+    {
+        if (st->ab_count >= BLEND_MIN_FRAMES || st->digital_started)
+        {
+            nrsc5_report_audio_blend(st, program, data, count);
+            return;
+        }
+    }
+
+    evt.event = NRSC5_EVENT_AUDIO;
+    evt.audio.program = program;
+    evt.audio.data = data;
+    evt.audio.count = count;
+    nrsc5_report(st, &evt);
+
+    if (program == 0)
+    {
+        if (!st->digital_started && data == zero_data)
+        {
+            nrsc5_reset_blend(st);
+            return;
+        }
+
+        if (st->ab_skip)
+        {
+            st->ab_skip--;
+            return;
+        }
+
+        ab = st->ab_free_list;
+        st->ab_free_list = ab->next;
+
+        memcpy(ab->data, data, count * sizeof(int16_t));
+        ab->next = NULL;
+        if (st->ab_tail)
+            st->ab_tail->next = ab;
+        else
+            st->ab_head = ab;
+        st->ab_tail = ab;
+
+        st->ab_count++;
+    }
 }
 
 void nrsc5_report_mer(nrsc5_t *st, float lower, float upper)

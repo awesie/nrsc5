@@ -22,7 +22,6 @@
 #endif
 
 #define AUDIO_FRAME_SAMPLES 4096
-#define MAX_RADIO_PROGRAMS 8
 // Pages are ~4KB, so the total buffer is ~128KB
 #define BUFFER_SIZE 32
 #define MAX_POST_SIZE 1024
@@ -98,7 +97,7 @@ typedef struct {
     char *cache_path;
     char *static_path;
 
-    server_program_t *program[8];
+    server_program_t *program[NRSC5_PROGRAMS];
     unsigned int facility_id;
     char *name;
 
@@ -549,6 +548,8 @@ static int handle_stream_request(server_t *server, session_data_t *session, stru
         program = 6;
     else if (strcasecmp(url, "/stream_7.ogg") == 0)
         program = 7;
+    else if (strcasecmp(url, "/stream_8.ogg") == 0)
+        program = 8;
 
     pthread_mutex_lock(&server->mutex);
     if (program != -1 && server->program[program] == NULL)
@@ -851,7 +852,7 @@ static int handle_json_request(server_t *server, session_data_t *session, struct
         cJSON_AddItemToObject(resp, "scanning", cJSON_CreateBool(server->scanning));
 
         resp_programs = cJSON_CreateArray();
-        for (unsigned int i = 0; i < MAX_RADIO_PROGRAMS; i++)
+        for (unsigned int i = 0; i < NRSC5_PROGRAMS; i++)
         {
             char path[256];
             cJSON *resp_program, *resp_id3;
@@ -1242,7 +1243,7 @@ static void radio_callback(const nrsc5_event_t *evt, void *opaque)
         }
         break;
     case NRSC5_EVENT_LOT:
-        for (unsigned int i = 0; i < MAX_RADIO_PROGRAMS; i++)
+        for (unsigned int i = 0; i < NRSC5_PROGRAMS; i++)
         {
             server_program_t *sp = server->program[i];
             if (sp == NULL)
@@ -1298,7 +1299,7 @@ static void server_reset(server_t *server)
     server->generation++;
 
     // free program information
-    for (int i = 0; i < MAX_RADIO_PROGRAMS; i++)
+    for (int i = 0; i < NRSC5_PROGRAMS; i++)
     {
         server_program_destroy(server->program[i]);
         server->program[i] = NULL;

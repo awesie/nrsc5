@@ -33,6 +33,8 @@ typedef struct
     unsigned int codec;
     unsigned int stream_id;
     unsigned int pdu_seq;
+    unsigned int pre_delay;
+    unsigned int post_delay;
     unsigned int pfirst;
     unsigned int plast;
     unsigned int seq;
@@ -168,6 +170,8 @@ static void parse_header(uint8_t *buf, frame_header_t *hdr)
     hdr->codec = buf[8] & 0xf;
     hdr->stream_id = (buf[8] >> 4) & 0x3;
     hdr->pdu_seq = (buf[8] >> 6) | ((buf[9] & 1) << 2);
+    hdr->pre_delay = ((int8_t)buf[9]) >> 3;
+    hdr->post_delay = buf[10] & 0x3f;
     hdr->pfirst = (buf[11] >> 1) & 1;
     hdr->plast = (buf[11] >> 2) & 1;
     hdr->seq = (buf[11] >> 3) | ((buf[12] & 1) << 5);
@@ -489,6 +493,8 @@ void frame_process(frame_t *st, size_t length)
             offset += parse_hef(st->buffer + offset, length - offset, &hef);
         prog = hef.prog_num;
 
+        log_debug("Program: %d, pre-delay: %d, post-delay: %d", prog, hdr.pre_delay, hdr.post_delay);
+
         parse_hdlc(st, aas_push, st->psd_buf[prog], &st->psd_idx[prog], MAX_AAS_LEN, st->buffer + offset, start + hdr.la_location + 1 - offset);
         offset = start + hdr.la_location + 1;
 
@@ -499,6 +505,8 @@ void frame_process(frame_t *st, size_t length)
             {
                 log_warn("crc mismatch!");
                 offset += cnt + 1;
+                if (!hdr.plast)
+                    input_pdu_push(st->input, NULL, 0, prog, prog ? 0 : hdr.pre_delay);
                 continue;
             }
 
@@ -507,7 +515,7 @@ void frame_process(frame_t *st, size_t length)
                 if (st->pdu_idx[prog])
                 {
                     memcpy(&st->pdu[prog][st->pdu_idx[prog]], st->buffer + offset, cnt);
-                    input_pdu_push(st->input, st->pdu[prog], cnt + st->pdu_idx[prog], prog);
+                    input_pdu_push(st->input, st->pdu[prog], cnt + st->pdu_idx[prog], prog, prog ? 0 : hdr.pre_delay);
                 }
                 else
                 {
@@ -521,7 +529,7 @@ void frame_process(frame_t *st, size_t length)
             }
             else
             {
-                input_pdu_push(st->input, st->buffer + offset, cnt, prog);
+                input_pdu_push(st->input, st->buffer + offset, cnt, prog, prog ? 0 : hdr.pre_delay);
             }
 
             offset += cnt + 1;

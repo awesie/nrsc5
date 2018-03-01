@@ -10,10 +10,12 @@
 #include "decode.h"
 #include "defines.h"
 #include "firdecim_q15.h"
+#include "fm_audio.h"
 #include "frame.h"
 #include "goertzel.h"
 #include "output.h"
 #include "sync.h"
+#include "resampler/speex_resampler.h"
 
 #define MAX_DECIM_LOG2 4
 
@@ -34,11 +36,13 @@ typedef struct input_t
     cint16_t *buffer;
     unsigned int avail, used, skip;
 
-    complex float fm_prev;
     firdecim_q15 fm_firdecim;
+    float fm_demod_phase;
+    float fm_demod_freq;
     goertzel_t fm_pilot, fm_not_pilot;
     float fm_pilot_sum, fm_not_pilot_sum;
     unsigned fm_pilot_idx, fm_not_pilot_idx;
+    fm_audio_t fm_audio;
 
     fftwf_plan snr_fft;
     float complex snr_fft_in[64];
@@ -61,5 +65,5 @@ int input_set_decimation(input_t *st, int);
 void input_set_offset_tuning(input_t *st, int);
 void input_set_snr_callback(input_t *st, input_snr_cb_t cb, void *);
 void input_set_skip(input_t *st, unsigned int skip);
-void input_pdu_push(input_t *st, uint8_t *pdu, unsigned int len, unsigned int program);
+void input_pdu_push(input_t *st, uint8_t *pdu, unsigned int len, unsigned int program, int gain);
 void input_aas_push(input_t *st, uint8_t *psd, unsigned int len);

@@ -25,6 +25,9 @@
 #define NRSC5_MIME_JPEG             0x1E653E9C
 #define NRSC5_MIME_PNG              0x4F328CA0
 
+#define NRSC5_PROGRAMS              9
+#define NRSC5_PROGRAM_ANALOG        8
+
 /*
  * Data types.
  */

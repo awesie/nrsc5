@@ -2,6 +2,7 @@ add_compile_options (--std=gnu11 -O3 -fstack-protector -Wall)
 set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fstack-protector")
 
 add_definitions (-D_GNU_SOURCE)
+add_definitions (-DHAVE_CONFIG_H)
 set (THREAD_LIBRARY pthread)
 if (CMAKE_SYSTEM_NAME MATCHES Linux)
     check_library_exists (${THREAD_LIBRARY} pthread_setname_np "" HAVE_PTHREAD_SETNAME_NP)
@@ -14,8 +15,11 @@ add_library (
     nrsc5
     acquire.c
     decode.c
+    fir_f.c
+    fm_audio.c
     frame.c
     goertzel.c
+    iir_f.c
     input.c
     nrsc5.c
     output.c
@@ -32,6 +36,8 @@ add_library (
     log.c
 
     strndup.c
+
+    resampler/resample.c
 )
 target_link_libraries (
     nrsc5

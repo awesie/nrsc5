@@ -27,11 +27,13 @@
 #include "log.h"
 
 #define AUDIO_BUFFERS 128
-#define AUDIO_THRESHOLD 40
+// FIXME Different for digital streams (e.g. add 32).
+#define AUDIO_THRESHOLD 8
 #define AUDIO_DATA_LENGTH 8192
 
 typedef struct buffer_t {
     struct buffer_t *next;
+    unsigned int count;
     // The samples are signed 16-bit integers, but ao_play requires a char buffer.
     char data[AUDIO_DATA_LENGTH];
 } audio_buffer_t;
@@ -121,8 +123,8 @@ static void push_audio_buffer(state_t *st, const int16_t *data, size_t count)
     st->free = b->next;
     pthread_mutex_unlock(&st->mutex);
 
-    assert(AUDIO_DATA_LENGTH == count * sizeof(data[0]));
-    memcpy(b->data, data, count * sizeof(data[0]));
+    b->count = count * sizeof(data[0]);
+    memcpy(b->data, data, b->count);
 
     pthread_mutex_lock(&st->mutex);
     b->next = NULL;
@@ -255,7 +257,6 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
             push_audio_buffer(st, evt->audio.data, evt->audio.count);
         break;
     case NRSC5_EVENT_SYNC:
-        st->audio_ready = 0;
         break;
     case NRSC5_EVENT_LOST_SYNC:
         break;
@@ -472,7 +473,7 @@ int main(int argc, char *argv[])
             st->tail = NULL;
         pthread_mutex_unlock(&st->mutex);
 
-        ao_play(st->dev, b->data, sizeof(b->data));
+        ao_play(st->dev, b->data, b->count);
 
         pthread_mutex_lock(&st->mutex);
         // add to free list
