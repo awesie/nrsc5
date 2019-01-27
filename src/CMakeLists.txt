@@ -7,7 +7,7 @@ if (CMAKE_SYSTEM_NAME MATCHES Linux)
 endif()
 
 configure_file (config.h.in config.h)
-include_directories ("${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/include")
+include_directories ("${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/include" "${SOAPY_SDR_INCLUDE_DIR}")
 
 add_library (
     nrsc5
@@ -36,7 +36,7 @@ target_link_libraries (
     ${FAAD2_LIBRARY}
     ${THREAD_LIBRARY}
     ${FFTW3F_LIBRARY}
-    ${RTL_SDR_LIBRARY}
+    ${SOAPY_SDR_LIBRARY}
     m
 )
 

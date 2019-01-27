@@ -1,8 +1,41 @@
 #include <assert.h>
+#include <SoapySDR/Device.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "private.h"
+
+#define RX_CHAN 0
+#define RX_BUFFER_FFT (16384)
+#define RX_BUFFER (RX_BUFFER_FFT * 4)
+#define RX_TRANSITION_BUFFERS 5
+#define RX_TIMEOUT 5000000
+#define AUTO_GAIN_STEP 4.0
+
+struct {
+    const char *driver;
+    float sample_rate;
+    unsigned int decimation;
+} supported_drivers[] = {
+    { "rtlsdr", SAMPLE_RATE, 2 },
+    { "hackrf", SAMPLE_RATE * 4, 8 },
+    { "sdrplay", SAMPLE_RATE * 2, 4 },
+    { 0 }
+};
+
+static int find_supported_driver(const char *driver, float *samp_rate, int *decimation)
+{
+    for (unsigned int i = 0; supported_drivers[i].driver; i++)
+    {
+        if (strcasecmp(driver, supported_drivers[i].driver) == 0)
+        {
+            *samp_rate = supported_drivers[i].sample_rate;
+            *decimation = supported_drivers[i].decimation;
+            return 0;
+        }
+    }
+    return 1;
+}
 
 static int snr_callback(void *arg, float snr)
 {
@@ -12,44 +45,44 @@ static int snr_callback(void *arg, float snr)
     return 1;
 }
 
-static int do_auto_gain(nrsc5_t *st)
+static int do_auto_gain(nrsc5_t *st, void *buf)
 {
-    int gain_count, best_gain = 0, ret = 1;
-    int *gain_list = NULL;
-    float best_snr = 0;
+    float best_gain = 0, best_snr = 0;
+    SoapySDRRange range;
 
     input_set_snr_callback(&st->input, snr_callback, st);
 
-    gain_count = rtlsdr_get_tuner_gains(st->dev, NULL);
-    if (gain_count < 0)
-        goto error;
-
-    gain_list = malloc(gain_count * sizeof(*gain_list));
-    if (!gain_list)
-        goto error;
-
-    gain_count = rtlsdr_get_tuner_gains(st->dev, gain_list);
-    if (gain_count < 0)
-        goto error;
-
-    for (int i = 0; i < gain_count; i++)
+    range = SoapySDRDevice_getGainRange(st->dev, SOAPY_SDR_RX, RX_CHAN);
+    log_debug("Gain range: %f - %f", range.minimum, range.maximum);
+    for (float gain = range.minimum; gain < range.maximum + AUTO_GAIN_STEP / 2; gain += AUTO_GAIN_STEP)
     {
-        int gain = gain_list[i];
+        int ignore;
 
-        if (rtlsdr_set_tuner_gain(st->dev, gain_list[i]) != 0)
+        if (gain > range.maximum)
+            gain = range.maximum;
+
+        if (SoapySDRDevice_setGain(st->dev, SOAPY_SDR_RX, RX_CHAN, gain) != 0)
             continue;
 
         st->auto_gain_snr_ready = 0;
+        // Two issues on RTL-SDR require ignoring the initial samples:
+        //   - after changing the gain there are some samples queued with old gain
+        //   - on Debian, changing the gain too quickly results in a freeze
         while (!st->auto_gain_snr_ready)
         {
-            int len = sizeof(st->samples_buf);
-
-            if (rtlsdr_read_sync(st->dev, st->samples_buf, len, &len) != 0)
+            int flags;
+            long long timeNs;
+            int count = SoapySDRDevice_readStream(st->dev, st->stream, &buf, RX_BUFFER_FFT * st->decimation,
+                    &flags, &timeNs, RX_TIMEOUT);
+            if (count < 0)
                 goto error;
 
-            input_cb(st->samples_buf, len, &st->input);
+            if (ignore)
+                ignore--;
+            else
+                input_cb(buf, count, &st->input);
         }
-        log_debug("AGC: %.2f (%.2f)", gain / 10.0f, st->auto_gain_snr);
+        log_debug("AGC: %.2f (%.2f)", gain, st->auto_gain_snr);
         if (st->auto_gain_snr > best_snr)
         {
             best_snr = st->auto_gain_snr;
@@ -58,26 +91,32 @@ static int do_auto_gain(nrsc5_t *st)
         input_reset(&st->input);
     }
 
-    log_debug("Best gain: %.2f (%.2f)", best_gain / 10.0f, best_snr);
+    log_debug("Best gain: %.2f (%.2f)", best_gain, best_snr);
     st->gain = best_gain;
-    rtlsdr_set_tuner_gain(st->dev, best_gain);
-    ret = 0;
+
+    SoapySDRDevice_setGain(st->dev, SOAPY_SDR_RX, RX_CHAN, st->gain);
+
+    input_set_snr_callback(&st->input, NULL, NULL);
+    return 0;
 
 error:
-    free(gain_list);
     input_set_snr_callback(&st->input, NULL, NULL);
-    return ret;
+    return 1;
 }
 
 static void *worker_thread(void *arg)
 {
     nrsc5_t *st = arg;
+    void *buf = malloc(RX_BUFFER * st->decimation * sizeof(cint16_t));
+    unsigned int ignore = RX_TRANSITION_BUFFERS;
 
     pthread_mutex_lock(&st->worker_mutex);
     while (!st->closed)
     {
         if (st->stopped && !st->worker_stopped)
         {
+            if (st->stream)
+                SoapySDRDevice_deactivateStream(st->dev, st->stream, 0, 0);
             st->worker_stopped = 1;
             pthread_cond_broadcast(&st->worker_cond);
         }
@@ -86,15 +125,16 @@ static void *worker_thread(void *arg)
             st->worker_stopped = 0;
             pthread_cond_broadcast(&st->worker_cond);
 
-            if (st->dev)
+            if (st->stream)
             {
-                if (rtlsdr_reset_buffer(st->dev) != 0)
-                    log_error("rtlsdr_reset_buffer failed");
+                if (SoapySDRDevice_activateStream(st->dev, st->stream, 0, 0, 0) != 0)
+                    log_error("activate stream failed");
 
                 if (st->auto_gain && st->gain < 0)
                 {
-                    if (do_auto_gain(st) != 0)
+                    if (do_auto_gain(st, buf) != 0)
                     {
+                        SoapySDRDevice_deactivateStream(st->dev, st->stream, 0, 0);
                         st->stopped = 1;
                         st->worker_stopped = 1;
                     }
@@ -109,26 +149,33 @@ static void *worker_thread(void *arg)
         }
         else
         {
-            int err = 0;
+            int count, flags;
+            long long timeNs;
 
             pthread_mutex_unlock(&st->worker_mutex);
 
-            if (st->dev)
+            if (st->stream)
             {
-                err = rtlsdr_read_async(st->dev, input_cb, &st->input, 8, 512 * 1024);
+                count = SoapySDRDevice_readStream(st->dev, st->stream, &buf, RX_BUFFER * st->decimation,
+                        &flags, &timeNs, RX_TIMEOUT);
+                if (count > 0)
+                {
+                    if (ignore > 0)
+                        ignore--;
+                    else
+                        input_cb(buf, count, &st->input);
+                }
             }
             else if (st->iq_file)
             {
-                unsigned int count = fread(st->samples_buf, 1, sizeof(st->samples_buf), st->iq_file);
+                count = fread(st->samples_buf, 1, sizeof(st->samples_buf), st->iq_file);
                 if (count > 0)
-                    input_cb(st->samples_buf, count, &st->input);
-                else
-                    err = 1;
+                    input_cb(buf, count, &st->input);
             }
 
             pthread_mutex_lock(&st->worker_mutex);
 
-            if (err)
+            if (count <= 0)
             {
                 st->stopped = 1;
                 st->worker_stopped = 1;
@@ -138,6 +185,7 @@ static void *worker_thread(void *arg)
     }
 
     pthread_mutex_unlock(&st->worker_mutex);
+    free(buf);
     return NULL;
 }
 
@@ -153,6 +201,7 @@ static void nrsc5_init(nrsc5_t *st)
 
     output_init(&st->output, st);
     input_init(&st->input, st, &st->output);
+    input_set_decimation(&st->input, st->decimation);
 
     // Create worker thread
     pthread_mutex_init(&st->worker_mutex, NULL);
@@ -160,22 +209,44 @@ static void nrsc5_init(nrsc5_t *st)
     pthread_create(&st->worker, NULL, worker_thread, st);
 }
 
-int nrsc5_open(nrsc5_t **result, int device_index, int ppm_error)
+int nrsc5_open(nrsc5_t **result, const char *args)
 {
-    int err;
+    size_t chan = RX_CHAN;
+    float bw, samp_rate;
     nrsc5_t *st = calloc(1, sizeof(*st));
 
-    if (rtlsdr_open(&st->dev, device_index) != 0)
+    st->dev = SoapySDRDevice_makeStrArgs(args);
+    if (!st->dev)
         goto error_init;
 
-    err = rtlsdr_set_sample_rate(st->dev, SAMPLE_RATE);
-    if (err) goto error;
-    err = rtlsdr_set_tuner_gain_mode(st->dev, 1);
-    if (err) goto error;
-    err = rtlsdr_set_freq_correction(st->dev, ppm_error);
-    if (err && err != -2) goto error;
-    err = rtlsdr_set_offset_tuning(st->dev, 1);
-    if (err && err != -2) goto error;
+    log_info("Driver: %s", SoapySDRDevice_getDriverKey(st->dev));
+    log_info("Hardware: %s", SoapySDRDevice_getHardwareKey(st->dev));
+
+    st->decimation = 2;
+    samp_rate = SAMPLE_RATE * st->decimation / 2;
+
+    if (find_supported_driver(SoapySDRDevice_getDriverKey(st->dev), &samp_rate, &st->decimation) != 0)
+        log_warn("Unsupported driver (%s). Please report success or failure along with a debug log.");
+
+    if (SoapySDRDevice_setSampleRate(st->dev, SOAPY_SDR_RX, chan, samp_rate) != 0)
+        goto error;
+    SoapySDRDevice_setBandwidth(st->dev, SOAPY_SDR_RX, chan, samp_rate / 2);
+
+    samp_rate = SoapySDRDevice_getSampleRate(st->dev, SOAPY_SDR_RX, chan);
+    bw = SoapySDRDevice_getBandwidth(st->dev, SOAPY_SDR_RX, chan);
+
+    log_info("Sample rate: %.2f", samp_rate);
+    log_info("Bandwidth: %.2f", bw);
+    log_debug("Decimation: %d", st->decimation);
+
+    if (SoapySDRDevice_setGainMode(st->dev, SOAPY_SDR_RX, chan, 0) != 0)
+        goto error;
+    if (SoapySDRDevice_setGain(st->dev, SOAPY_SDR_RX, chan, st->gain) != 0)
+        goto error;
+    if (SoapySDRDevice_setFrequency(st->dev, SOAPY_SDR_RX, chan, st->freq + FREQ_OFFSET, NULL) != 0)
+        goto error;
+    if (SoapySDRDevice_setupStream(st->dev, &st->stream, SOAPY_SDR_RX, "CS16", &chan, 1, NULL) != 0)
+        goto error;
 
     nrsc5_init(st);
 
@@ -183,8 +254,7 @@ int nrsc5_open(nrsc5_t **result, int device_index, int ppm_error)
     return 0;
 
 error:
-    log_error("nrsc5_open error: %d", err);
-    rtlsdr_close(st->dev);
+    SoapySDRDevice_unmake(st->dev);
 error_init:
     free(st);
     *result = NULL;
@@ -207,6 +277,7 @@ int nrsc5_open_iq(nrsc5_t **result, const char *path)
     st->decimation = 2;
     st->iq_file = fp;
     nrsc5_init(st);
+    input_set_freq_offset(&st->input, 0.0f);
 
     *result = st;
     return 0;
@@ -226,8 +297,10 @@ void nrsc5_close(nrsc5_t *st)
     // wait for worker to finish
     pthread_join(st->worker, NULL);
 
+    if (st->stream)
+        SoapySDRDevice_closeStream(st->dev, st->stream);
     if (st->dev)
-        rtlsdr_close(st->dev);
+        SoapySDRDevice_unmake(st->dev);
     if (st->iq_file)
         fclose(st->iq_file);
     free(st);
@@ -260,7 +333,7 @@ void nrsc5_stop(nrsc5_t *st)
 void nrsc5_get_frequency(nrsc5_t *st, float *freq)
 {
     if (st->dev)
-        *freq = rtlsdr_get_center_freq(st->dev);
+        *freq = SoapySDRDevice_getFrequency(st->dev, SOAPY_SDR_RX, RX_CHAN) - FREQ_OFFSET;
     else
         *freq = st->freq;
 }
@@ -274,7 +347,7 @@ int nrsc5_set_frequency(nrsc5_t *st, float freq)
 
     if (st->dev)
     {
-        if (rtlsdr_set_center_freq(st->dev, freq) != 0)
+        if (SoapySDRDevice_setFrequency(st->dev, SOAPY_SDR_RX, RX_CHAN, freq + FREQ_OFFSET, NULL) != 0)
             return 1;
     }
 
@@ -285,7 +358,7 @@ int nrsc5_set_frequency(nrsc5_t *st, float freq)
 void nrsc5_get_gain(nrsc5_t *st, float *gain)
 {
     if (st->dev)
-        *gain = rtlsdr_get_tuner_gain(st->dev) / 10.0f;
+        *gain = SoapySDRDevice_getGain(st->dev, SOAPY_SDR_RX, RX_CHAN);
     else
         *gain = st->gain;
 }
@@ -299,7 +372,7 @@ int nrsc5_set_gain(nrsc5_t *st, float gain)
 
     if (st->dev)
     {
-        if (rtlsdr_set_tuner_gain(st->dev, gain * 10) != 0)
+        if (SoapySDRDevice_setGain(st->dev, SOAPY_SDR_RX, RX_CHAN, gain) != 0)
             return 1;
     }
 

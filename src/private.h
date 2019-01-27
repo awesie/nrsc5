@@ -1,8 +1,8 @@
 #pragma once
 
 #include <pthread.h>
-#include <rtl-sdr.h>
 #include <stdio.h>
+#include <SoapySDR/Device.h>
 
 #include <nrsc5.h>
 
@@ -13,12 +13,12 @@
 
 struct nrsc5_t
 {
-    rtlsdr_dev_t *dev;
+    SoapySDRDevice *dev;
+    SoapySDRStream *stream;
     FILE *iq_file;
-    uint8_t samples_buf[128 * 256];
     float freq;
     int decimation;
-    int gain;
+    float gain;
     int auto_gain;
     int auto_gain_snr_ready;
     float auto_gain_snr;

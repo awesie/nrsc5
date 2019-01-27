@@ -67,15 +67,15 @@ void input_set_skip(input_t *st, unsigned int skip)
     st->skip += skip;
 }
 
-static void measure_snr(input_t *st, uint8_t *buf, uint32_t len)
+static void measure_snr(input_t *st, cint16_t *buf, uint32_t len)
 {
     unsigned int i, j;
 
     // use a small FFT to calculate magnitude of frequency ranges
-    for (j = 64; j <= len / 2; j += 64)
+    for (j = 64; j <= len; j += 64)
     {
         for (i = 0; i < 64; i++)
-            st->snr_fft_in[i] = CMPLXF(U8_F(buf[(i+j-64) * 2 + 0]), U8_F(buf[(i+j-64) * 2 + 1])) * pow(sinf(M_PI*i/63),2);
+            st->snr_fft_in[i] = cq15_to_cf(buf[i + j - 64]) * pow(sinf(M_PI*i/63), 2);
         fftwf_execute(st->snr_fft);
         fftshift(st->snr_fft_out, 64);
 
@@ -118,10 +118,43 @@ static void measure_snr(input_t *st, uint8_t *buf, uint32_t len)
     }
 }
 
-void input_cb(uint8_t *buf, uint32_t len, void *arg)
+void input_cb(cint16_t *buf, uint32_t len, void *arg)
 {
-    unsigned int i, new_avail, cnt = len / 4;
+    unsigned int i, j, new_avail;
     input_t *st = arg;
+
+    // Avoid clipping by immediately decreasing gain.
+    // None of the supported drivers have better than 14-bit resolution,
+    // so this will not lose any information.
+    for (i = 0; i < len; i++)
+    {
+        buf[i].r /= 2;
+        buf[i].i /= 2;
+    }
+
+    for (j = 1; j < st->decim_log2; j++)
+    {
+        for (i = 0; i < len; i += 2)
+        {
+            cint16_t x[2];
+
+            x[0].r = buf[i].r;
+            x[0].i = buf[i].i;
+            x[1].r = buf[i + 1].r;
+            x[1].i = buf[i + 1].i;
+
+            halfband_q15_execute(st->firdecim[j], x, &buf[i / 2]);
+        }
+        len /= 2;
+    }
+
+    // correct frequency offset
+    for (i = 0; i < len; i++)
+    {
+        st->phase *= st->phase_increment;
+        buf[i] = cf_to_cq15(cq15_to_cf(buf[i]) * st->phase);
+    }
+    st->phase /= cabsf(st->phase);
 
     if (st->snr_cb)
     {
@@ -129,9 +162,9 @@ void input_cb(uint8_t *buf, uint32_t len, void *arg)
         return;
     }
 
-    nrsc5_report_iq(st->radio, buf, len);
+    nrsc5_report_iq(st->radio, buf, len * sizeof(buf[0]));
 
-    if (cnt + st->avail > INPUT_BUF_LEN)
+    if (len / 2 + st->avail > INPUT_BUF_LEN)
     {
         if (st->avail > st->used)
         {
@@ -147,23 +180,29 @@ void input_cb(uint8_t *buf, uint32_t len, void *arg)
     }
     new_avail = st->avail;
 
-    if (cnt + new_avail > INPUT_BUF_LEN)
+    if (len / 2 + new_avail > INPUT_BUF_LEN)
     {
         log_error("input buffer overflow!");
         return;
     }
-    assert(len % 4 == 0);
 
-    for (i = 0; i < cnt; i++)
+    for (i = 0; i < len; i += 2)
     {
-        cint16_t x[2];
+        cint16_t x[2], y;
 
-        x[0].r = U8_Q15(buf[i * 4 + 0]);
-        x[0].i = -U8_Q15(buf[i * 4 + 1]);
-        x[1].r = U8_Q15(buf[i * 4 + 2]);
-        x[1].i = -U8_Q15(buf[i * 4 + 3]);
+        x[0].r = buf[i].r;
+        x[0].i = -buf[i].i;
+        x[1].r = buf[i + 1].r;
+        x[1].i = -buf[i + 1].i;
 
-        halfband_q15_execute(st->decim, x, &st->buffer[new_avail++]);
+        if (x[0].r >= 0x7E00 || x[0].i >= 0x7E00 || x[1].r >= 0x7E00 || x[1].i >= 0x7E00 ||
+            x[0].r <= -0x7E00 || x[0].i <= -0x7E00 || x[1].r <= -0x7E00 || x[1].i <= -0x7E00)
+        {
+            log_warn("Clipping");
+        }
+
+        halfband_q15_execute(st->firdecim[0], x, &y);
+        st->buffer[new_avail++] = y;
     }
 
     st->avail = new_avail;
@@ -190,6 +229,28 @@ void input_reset(input_t *st)
     st->snr_cnt = 0;
 }
 
+int input_set_decimation(input_t *st, int decimation)
+{
+    if (decimation == 2)
+        st->decim_log2 = 1;
+    else if (decimation == 4)
+        st->decim_log2 = 2;
+    else if (decimation == 8)
+        st->decim_log2 = 3;
+    else if (decimation == 16)
+        st->decim_log2 = 4;
+    else
+        return 1;
+    st->decimation = decimation;
+    return 0;
+}
+
+void input_set_freq_offset(input_t *st, float offset)
+{
+    st->phase_increment = cexpf(2 * M_PI * offset / SAMPLE_RATE * I);
+    st->phase = st->phase_increment;
+}
+
 void input_init(input_t *st, nrsc5_t *radio, output_t *output)
 {
     st->radio = radio;
@@ -197,7 +258,13 @@ void input_init(input_t *st, nrsc5_t *radio, output_t *output)
     st->snr_cb = NULL;
     st->snr_cb_arg = NULL;
 
-    st->decim = firdecim_q15_create(decim_taps, sizeof(decim_taps) / sizeof(decim_taps[0]));
+    st->phase_increment = cexpf(2 * M_PI * FREQ_OFFSET / SAMPLE_RATE * I);
+    st->phase = st->phase_increment;
+    st->decimation = 2;
+    st->decim_log2 = 1;
+
+    for (int i = 0; i < MAX_DECIM_LOG2; i++)
+        st->firdecim[i] = firdecim_q15_create(decim_taps, sizeof(decim_taps) / sizeof(decim_taps[0]));
     st->snr_fft = fftwf_plan_dft_1d(64, st->snr_fft_in, st->snr_fft_out, FFTW_FORWARD, 0);
 
     input_reset(st);
@@ -212,7 +279,8 @@ void input_free(input_t *st)
 {
     acquire_free(&st->acq);
 
-    firdecim_q15_free(st->decim);
+    for (int i = 0; i < MAX_DECIM_LOG2; i++)
+        firdecim_q15_free(st->firdecim[i]);
     fftwf_destroy_plan(st->snr_fft);
     fftwf_cleanup();
 }

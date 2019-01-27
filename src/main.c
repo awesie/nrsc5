@@ -39,8 +39,7 @@ typedef struct buffer_t {
 typedef struct {
     float freq;
     float gain;
-    unsigned int device_index;
-    int ppm_error;
+    char *device_args;
     char *input_name;
     ao_device *dev;
     FILE *hdc_file;
@@ -291,7 +290,7 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
 
 static void help(const char *progname)
 {
-    fprintf(stderr, "Usage: %s [-v] [-q] [-l log-level] [-d device-index] [-p ppm-error] [-g gain] [-r iq-input] [-w iq-output] [-o wav-output] [--dump-hdc hdc-output] [--dump-aas-files directory] frequency program\n", progname);
+    fprintf(stderr, "Usage: %s [-v] [-q] [-l log-level] [-d device-args] [-g gain] [-r iq-input] [-w iq-output] [-o wav-output] [--dump-hdc hdc-output] [--dump-aas-files directory] frequency program\n", progname);
 }
 
 static int parse_args(state_t *st, int argc, char *argv[])
@@ -327,10 +326,7 @@ static int parse_args(state_t *st, int argc, char *argv[])
             audio_name = optarg;
             break;
         case 'd':
-            st->device_index = strtoul(optarg, NULL, 10);
-            break;
-        case 'p':
-            st->ppm_error = strtol(optarg, NULL, 10);
+            st->device_args = strdup(optarg);
             break;
         case 'g':
             st->gain = strtof(optarg, &endptr);
@@ -456,7 +452,7 @@ int main(int argc, char *argv[])
     }
     else
     {
-        if (nrsc5_open(&radio, st->device_index, st->ppm_error) != 0)
+        if (nrsc5_open(&radio, st->device_args) != 0)
         {
             log_fatal("Open device failed.");
             return 1;

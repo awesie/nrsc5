@@ -157,7 +157,7 @@ typedef struct nrsc5_t nrsc5_t;
 /*
  * Public functions. All functions return void or an error code (0 == success).
  */
-int nrsc5_open(nrsc5_t **, int device_index, int ppm_error);
+int nrsc5_open(nrsc5_t **, const char *args);
 int nrsc5_open_iq(nrsc5_t **, const char *path);
 void nrsc5_close(nrsc5_t *);
 void nrsc5_start(nrsc5_t *);

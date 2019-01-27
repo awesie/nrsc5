@@ -30,7 +30,7 @@ if (NOT PATCH)
 endif()
 
 find_library (FFTW3F_LIBRARY fftw3f)
-find_library (RTL_SDR_LIBRARY rtlsdr)
+find_package (SoapySDR REQUIRED)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm.*")
     if (USE_NEON)
