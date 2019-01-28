@@ -517,6 +517,17 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
     }
 }
 
+void nrsc5_report_sis(nrsc5_t *st, pids_t *pids)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_SIS;
+    evt.sis.name = pids->short_name;
+    evt.sis.facility_id = pids->fcc_facility_id;
+
+    nrsc5_report(st, &evt);
+}
+
 // Logging support
 void log_noop(int level, const char *file, int line, const char *fmt, ...) {}
 nrsc5_logger_t nrsc5_log_fn = log_noop;

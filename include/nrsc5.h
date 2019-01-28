@@ -84,7 +84,8 @@ enum
     NRSC5_EVENT_AUDIO,
     NRSC5_EVENT_ID3,
     NRSC5_EVENT_SIG,
-    NRSC5_EVENT_LOT
+    NRSC5_EVENT_LOT,
+    NRSC5_EVENT_SIS
 };
 
 struct nrsc5_event_t
@@ -140,6 +141,10 @@ struct nrsc5_event_t
         struct {
             nrsc5_sig_service_t *services;
         } sig;
+        struct {
+            const char *name;
+            unsigned int facility_id;
+        } sis;
     };
 };
 typedef struct nrsc5_event_t nrsc5_event_t;
