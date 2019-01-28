@@ -94,3 +94,4 @@ endif()
 add_definitions("-DGIT_COMMIT_HASH=\"${GIT_COMMIT_HASH}\"")
 
 add_subdirectory (src)
+add_subdirectory (app)

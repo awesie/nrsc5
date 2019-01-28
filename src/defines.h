@@ -7,7 +7,8 @@
 #include <stdlib.h>
 #include <complex.h>
 #include <math.h>
-#include "log.h"
+
+#include <nrsc5.h>
 
 #define FATAL_EXIT(...) do { log_fatal(__VA_ARGS__); exit(1); } while (0)
 
@@ -86,3 +87,12 @@ static inline void fftshift(float complex *x, unsigned int size)
         x[i+3 + h] = t4;
     }
 }
+
+// Logging wrappers.
+#define log_trace(...) nrsc5_log_fn(NRSC5_LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
+#define log_debug(...) nrsc5_log_fn(NRSC5_LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+#define log_info(...)  nrsc5_log_fn(NRSC5_LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)
+#define log_warn(...)  nrsc5_log_fn(NRSC5_LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
+#define log_error(...) nrsc5_log_fn(NRSC5_LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
+#define log_fatal(...) nrsc5_log_fn(NRSC5_LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
+extern nrsc5_logger_t nrsc5_log_fn;

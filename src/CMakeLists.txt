@@ -27,8 +27,6 @@ add_library (
     reed-solomon.c
     galois.c
 
-    log.c
-
     strndup.c
 )
 target_link_libraries (
@@ -38,21 +36,4 @@ target_link_libraries (
     ${FFTW3F_LIBRARY}
     ${RTL_SDR_LIBRARY}
     m
-)
-
-add_executable (
-    app
-    main.c
-)
-set_property (TARGET app PROPERTY OUTPUT_NAME nrsc5)
-target_link_libraries (
-    app
-    nrsc5
-    ${AO_LIBRARY}
-    ${THREAD_LIBRARY}
-)
-
-install (
-    TARGETS app
-    RUNTIME DESTINATION bin
 )

@@ -516,3 +516,12 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
         free(p);
     }
 }
+
+// Logging support
+void log_noop(int level, const char *file, int line, const char *fmt, ...) {}
+nrsc5_logger_t nrsc5_log_fn = log_noop;
+
+void nrsc5_set_logger(nrsc5_logger_t logger)
+{
+    nrsc5_log_fn = logger;
+}

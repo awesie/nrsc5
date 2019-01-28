@@ -166,4 +166,20 @@ int nrsc5_set_gain(nrsc5_t *, float gain);
 void nrsc5_set_auto_gain(nrsc5_t *, int enabled);
 void nrsc5_set_callback(nrsc5_t *, nrsc5_callback_t callback, void *opaque);
 
+/*
+ * Global logging support.
+ */
+enum
+{
+    NRSC5_LOG_TRACE,
+    NRSC5_LOG_DEBUG,
+    NRSC5_LOG_INFO,
+    NRSC5_LOG_WARN,
+    NRSC5_LOG_ERROR,
+    NRSC5_LOG_FATAL
+};
+
+typedef void (*nrsc5_logger_t)(int level, const char *file, int line, const char *fmt, ...);
+void nrsc5_set_logger(nrsc5_logger_t logger);
+
 #endif /* NRSC5_H_ */

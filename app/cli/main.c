@@ -464,6 +464,7 @@ int main(int argc, char *argv[])
     pthread_mutex_init(&log_mutex, NULL);
     log_set_lock(log_lock);
     log_set_udata(&log_mutex);
+    nrsc5_set_logger(log_log);
 
     ao_initialize();
     init_audio_buffers(st);
