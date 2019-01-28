@@ -51,9 +51,12 @@ void output_push(output_t *st, uint8_t *pkt, unsigned int len, unsigned int prog
 static void aas_free_lot(aas_file_t *file)
 {
     free(file->name);
-    for (int i = 0; i < MAX_LOT_FRAGMENTS; i++)
-        free(file->fragments[i]);
-    free(file->fragments);
+    if (file->fragments)
+    {
+        for (int i = 0; i < MAX_LOT_FRAGMENTS; i++)
+            free(file->fragments[i]);
+        free(file->fragments);
+    }
     memset(file, 0, sizeof(*file));
 }
 
@@ -85,7 +88,7 @@ static void aas_reset(output_t *st)
     memset(st->services, 0, sizeof(st->services));
 }
 
-static void output_reset(output_t *st)
+void output_reset(output_t *st)
 {
     aas_reset(st);
 
