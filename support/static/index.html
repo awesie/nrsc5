@@ -1,0 +1,178 @@
+<!doctype html>
+<html>
+    <body>
+        <div>
+            <button onclick="scan()">Start Scan</button>
+        </div>
+        <div id="scan_results">
+        </div>
+        <div id="station">
+        </div>
+        <div id="programs">
+        </div>
+        <script>
+            function setFrequency(frequency)
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+                });
+                req.open("POST", "/api/frequency");
+                req.setRequestHeader("Content-type", "application/json");
+                req.send(JSON.stringify({frequency}));
+            }
+            function scan()
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+                    if (resp.success)
+                        queryScan();
+                });
+                req.open("POST", "/api/scan");
+                req.setRequestHeader("Content-type", "application/json");
+                req.send(JSON.stringify({}));
+            }
+            function queryScan()
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+
+                    var html = '';
+                    for (var idx = 0; idx < resp.results.length; idx++)
+                    {
+                        var scan = resp.results[idx];
+                        html += `<div><a href="#" onclick="setFrequency(${scan.frequency})">${scan.frequency}</a> (${scan.name})</div>`;
+                    }
+                    document.getElementById('scan_results').innerHTML = html;
+
+                    if (resp.scanning)
+                        setTimeout(queryScan, 1000);
+                });
+                req.open("GET", "/api/scan");
+                req.send();
+            }
+            function constructProgram(program)
+            {
+                var html = '';
+                var id3 = program.id3 && program.id3[0];
+
+                if (program.id !== undefined)
+                    html += `<div class="program_id">${program.id}</div>`;
+                if (program.hdc_bitrate !== undefined)
+                    html += `<div class="hdc_bitrate">${program.hdc_bitrate}</div>`;
+                if (id3)
+                {
+                    if (id3.title)
+                        html += `<div class="title">${id3.title}</div>`;
+                    if (id3.artist)
+                        html += `<div class="artist">${id3.artist}</div>`;
+                    if (id3.album)
+                        html += `<div class="album">${id3.album}</div>`;
+                    if (id3.genre)
+                        html += `<div class="genre">${id3.genre}</div>`;
+                }
+
+                return html;
+            }
+            function constructStation(resp)
+            {
+                var html = '';
+
+                if (resp.name)
+                    html += `<div class="station_name">${resp.name}</div>`;
+                if (resp.facility_id)
+                    html += `<div class="facility_id">${resp.facility_id}</div>`;
+                if (resp.frequency)
+                    html += `<div class="frequency">${resp.frequency}</div>`;
+                if (resp.cber !== undefined)
+                    html += `<div class="cber">${resp.cber}</div>`;
+                if (resp.mer_lower !== undefined)
+                    html += `<div class="mer_lower">${resp.mer_lower}</div>`;
+                if (resp.mer_upper !== undefined)
+                    html += `<div class="mer_upper">${resp.mer_upper}</div>`;
+
+                return html;
+            }
+            function queryStatus()
+            {
+                var req = new XMLHttpRequest();
+                req.addEventListener("load", function () {
+                    setTimeout(queryStatus, 1000);
+
+                    if (this.status != 200)
+                        return;
+
+                    var resp = JSON.parse(this.responseText);
+                    document.getElementById('station').innerHTML = constructStation(resp);
+
+                    var usedElements = [];
+                    for (var idx = 0; idx < resp.programs.length; idx++)
+                    {
+                        var program = resp.programs[idx];
+                        var el = document.getElementById('program_' + program.id);
+                        if (!el)
+                        {
+                            el = document.createElement('div');
+                            el.id = 'program_' + program.id;
+                            document.getElementById('programs').appendChild(el);
+                        }
+                        el.innerHTML = constructProgram(program);
+                        usedElements.push(el);
+
+                        var image_el = document.getElementById('program_image_' + program.id);
+                        if (!image_el)
+                        {
+                            image_el = document.createElement('img');
+                            image_el.id = 'program_image_' + program.id;
+                            document.getElementById('programs').appendChild(image_el);
+                        }
+                        var image_src = program.id3 && program.id3[0] && program.id3[0].image;
+                        if (image_el.dataset.src != image_src)
+                        {
+                            image_el.dataset.src = image_src;
+                            image_el.src = image_src;
+                        }
+                        usedElements.push(image_el);
+
+                        var audio_el = document.getElementById('program_audio_' + program.id);
+                        if (!audio_el)
+                        {
+                            audio_el = document.createElement('div');
+                            audio_el.id = 'program_audio_' + program.id;
+                            audio_el.innerHTML = '<audio controls preload="none"></audio>';
+                            document.getElementById('programs').appendChild(audio_el);
+                        }
+                        if (audio_el.dataset.src != program.audio)
+                        {
+                            audio_el.dataset.src = program.audio;
+                            audio_el.children[0].src = program.audio;
+                        }
+                        usedElements.push(audio_el);
+                    }
+
+                    var children = Array.from(document.getElementById('programs').children);
+                    for (var idx = 0; idx < children.length; idx++)
+                    {
+                        if (usedElements.indexOf(children[idx]) == -1)
+                            document.getElementById('programs').removeChild(children[idx]);
+                    }
+                });
+                req.open("GET", "/api/status");
+                req.send();
+            }
+            queryScan();
+            queryStatus();
+        </script>
+    </body>
+</html>
